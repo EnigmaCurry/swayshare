@@ -1,0 +1,348 @@
+//! Command-line interface.
+//!
+//! Peer management touches the config file directly; everything that affects
+//! live access goes through the daemon over the control socket.
+
+use crate::config::{self, Config};
+use crate::daemon::{self, Daemon};
+use crate::invite;
+use crate::ipc::{self, Request, Response};
+use crate::paths;
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use ipnet::IpNet;
+use std::path::PathBuf;
+use std::time::Duration;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "swayshare",
+    about = "Temporary, peer-scoped remote desktop access for Sway",
+    long_about = "swayshare grants one named peer temporary access to your Sway \
+                  desktop. wayvnc does the screen sharing on a private Unix socket; \
+                  swayshare decides who may reach it.",
+    version
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Add a peer that may be granted access later
+    Add {
+        /// Short name, e.g. "mike"
+        name: String,
+        /// Address or range the peer connects from, e.g. 10.0.0.3/32
+        cidr: String,
+        /// Accept a range wider than a /24
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove a peer
+    #[command(visible_alias = "remove")]
+    Rm { name: String },
+    /// List configured peers
+    #[command(visible_alias = "peers")]
+    List,
+    /// Enable access for one peer
+    Start {
+        name: String,
+        /// Minutes before access is revoked automatically
+        #[arg(long, value_name = "MINUTES")]
+        minutes: Option<u64>,
+        /// Do not expire the session automatically
+        #[arg(long, conflicts_with = "minutes")]
+        no_expire: bool,
+        /// Fail instead of starting a daemon when none is running
+        #[arg(long)]
+        no_spawn: bool,
+    },
+    /// Revoke access immediately
+    Stop,
+    /// Show the current sharing state
+    Status {
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-print the invitation for the running session
+    Invite,
+    /// Run the supervisor in the foreground
+    Daemon,
+    /// Stop sharing and exit the running daemon
+    Quit,
+    /// Print the config file path
+    #[command(name = "config-path")]
+    ConfigPath,
+}
+
+pub fn run() -> Result<()> {
+    let cli = Cli::parse();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?;
+    runtime.block_on(dispatch(cli.command))
+}
+
+async fn dispatch(command: Command) -> Result<()> {
+    match command {
+        Command::Add { name, cidr, force } => add_peer(&name, &cidr, force),
+        Command::Rm { name } => remove_peer(&name),
+        Command::List => list_peers(),
+        Command::Start {
+            name,
+            minutes,
+            no_expire,
+            no_spawn,
+        } => {
+            // `Some(0)` is the wire encoding for "no expiry"; `None` means
+            // "use the configured default".
+            let minutes = if no_expire { Some(0) } else { minutes };
+            start(&name, minutes, no_spawn).await
+        }
+        Command::Stop => simple(Request::Stop, "Sharing stopped.").await,
+        Command::Status { json } => status(json).await,
+        Command::Invite => show_invite().await,
+        Command::Daemon => Daemon::run().await,
+        Command::Quit => simple(Request::Shutdown, "Daemon stopped.").await,
+        Command::ConfigPath => {
+            println!("{}", paths::config_file()?.display());
+            Ok(())
+        }
+    }
+}
+
+fn add_peer(name: &str, cidr: &str, force: bool) -> Result<()> {
+    let parsed = parse_cidr(cidr)?;
+    if let Some(warning) = config::breadth_warning(&parsed) {
+        if config::requires_force(&parsed) && !force {
+            bail!("{warning}\nRe-run with --force if that is really what you want.");
+        }
+        eprintln!("warning: {warning}");
+    }
+
+    let mut cfg = Config::load()?;
+    cfg.add_peer(name, parsed)?;
+    cfg.save()?;
+    println!("Added peer {name} ({parsed}).");
+    Ok(())
+}
+
+/// Accept both a bare address and a CIDR, treating the former as a host route.
+///
+/// Typing `10.0.0.3` and silently getting a whole subnet would be the worst
+/// possible surprise here, so a bare address becomes an explicit /32 or /128.
+fn parse_cidr(input: &str) -> Result<IpNet> {
+    if let Ok(net) = input.parse::<IpNet>() {
+        // `IpNet` accepts a host address with non-zero bits outside the prefix
+        // (10.0.0.3/24); truncate so the stored range is unambiguous.
+        return Ok(net.trunc());
+    }
+    if let Ok(ip) = input.parse::<std::net::IpAddr>() {
+        return Ok(IpNet::from(ip));
+    }
+    bail!("'{input}' is not an IP address or CIDR range")
+}
+
+fn remove_peer(name: &str) -> Result<()> {
+    let mut cfg = Config::load()?;
+    let peer = cfg.remove_peer(name)?;
+    cfg.save()?;
+    println!("Removed peer {} ({}).", peer.name, peer.cidr);
+    eprintln!("note: this does not stop a session already running for that peer.");
+    Ok(())
+}
+
+fn list_peers() -> Result<()> {
+    let cfg = Config::load()?;
+    if cfg.peers.is_empty() {
+        println!("No peers configured. Add one with: swayshare add <name> <cidr>");
+        return Ok(());
+    }
+    let width = cfg.peers.iter().map(|p| p.name.len()).max().unwrap_or(4);
+    for peer in &cfg.peers {
+        let note = match config::breadth_warning(&peer.cidr) {
+            Some(_) if config::requires_force(&peer.cidr) => "  (too broad to share)",
+            Some(_) => "  (range, not a single host)",
+            None => "",
+        };
+        println!("{:width$}  {}{}", peer.name, peer.cidr, note, width = width);
+    }
+    Ok(())
+}
+
+async fn start(name: &str, minutes: Option<u64>, no_spawn: bool) -> Result<()> {
+    let socket = paths::control_socket()?;
+    if !daemon_is_running(&socket).await {
+        if no_spawn {
+            bail!("the swayshare daemon is not running (try: swayshare daemon)");
+        }
+        spawn_daemon(&socket).await?;
+    }
+
+    let req = Request::Start {
+        peer: name.to_string(),
+        minutes,
+    };
+    match ipc::expect_ok(ipc::request(&socket, &req).await?)? {
+        Response::Session(session) => {
+            print!("{}", invite::render(&session));
+            Ok(())
+        }
+        other => bail!("unexpected reply from the daemon: {other:?}"),
+    }
+}
+
+async fn simple(req: Request, message: &str) -> Result<()> {
+    let socket = paths::control_socket()?;
+    ipc::expect_ok(ipc::request(&socket, &req).await?)?;
+    println!("{message}");
+    Ok(())
+}
+
+async fn status(json: bool) -> Result<()> {
+    let socket = paths::control_socket()?;
+    // A daemon that is not running is not an error: it means "off", which is
+    // exactly what a status bar or keybinding wants to hear.
+    let status = if daemon_is_running(&socket).await {
+        match ipc::expect_ok(ipc::request(&socket, &Request::Status).await?)? {
+            Response::Status(s) => s,
+            other => bail!("unexpected reply from the daemon: {other:?}"),
+        }
+    } else {
+        ipc::Status::off()
+    };
+
+    if json {
+        println!("{}", serde_json::to_string(&status)?);
+    } else {
+        print!("{}", daemon::render_status(&status));
+    }
+    Ok(())
+}
+
+async fn show_invite() -> Result<()> {
+    let socket = paths::control_socket()?;
+    match ipc::expect_ok(ipc::request(&socket, &Request::Invite).await?)? {
+        Response::Session(session) => {
+            print!("{}", invite::render(&session));
+            Ok(())
+        }
+        other => bail!("unexpected reply from the daemon: {other:?}"),
+    }
+}
+
+async fn daemon_is_running(socket: &std::path::Path) -> bool {
+    tokio::net::UnixStream::connect(socket).await.is_ok()
+}
+
+/// Start a detached daemon so `swayshare start` works from a keybinding.
+///
+/// The child is put in its own process group, so closing the terminal that
+/// launched it does not take the session down with it.
+async fn spawn_daemon(socket: &std::path::Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let exe = std::env::current_exe().context("locating the swayshare executable")?;
+    let log_path: PathBuf = paths::runtime_dir()?.join("daemon.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("opening {}", log_path.display()))?;
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log.try_clone()?))
+        .stderr(std::process::Stdio::from(log));
+    cmd.process_group(0);
+    cmd.spawn().context("starting the swayshare daemon")?;
+
+    // Wait for the control socket rather than guessing at a fixed delay.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if daemon_is_running(socket).await {
+            eprintln!(
+                "note: started a swayshare daemon; its log is at {}",
+                log_path.display()
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    bail!(
+        "the swayshare daemon did not come up within 5s; see {}",
+        log_path.display()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_addresses_become_host_routes() {
+        assert_eq!(
+            parse_cidr("10.0.0.3").unwrap(),
+            "10.0.0.3/32".parse::<IpNet>().unwrap()
+        );
+        assert_eq!(
+            parse_cidr("fd00::3").unwrap(),
+            "fd00::3/128".parse::<IpNet>().unwrap()
+        );
+    }
+
+    #[test]
+    fn cidrs_are_truncated_to_their_prefix() {
+        // Otherwise "10.0.0.3/24" would read as one host but match 256.
+        assert_eq!(
+            parse_cidr("10.0.0.3/24").unwrap(),
+            "10.0.0.0/24".parse::<IpNet>().unwrap()
+        );
+    }
+
+    #[test]
+    fn nonsense_is_rejected() {
+        assert!(parse_cidr("mike").is_err());
+        assert!(parse_cidr("10.0.0.300/32").is_err());
+        assert!(parse_cidr("10.0.0.3/33").is_err());
+        assert!(parse_cidr("").is_err());
+    }
+
+    #[test]
+    fn cli_parses_the_documented_invocations() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+
+        let cli = Cli::try_parse_from(["swayshare", "add", "mike", "10.0.0.3/32"]).unwrap();
+        assert!(matches!(cli.command, Command::Add { .. }));
+
+        let cli = Cli::try_parse_from(["swayshare", "start", "mike", "--minutes", "30"]).unwrap();
+        match cli.command {
+            Command::Start { name, minutes, .. } => {
+                assert_eq!(name, "mike");
+                assert_eq!(minutes, Some(30));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        assert!(Cli::try_parse_from(["swayshare", "status"]).is_ok());
+        assert!(Cli::try_parse_from(["swayshare", "stop"]).is_ok());
+        // --minutes and --no-expire are contradictory.
+        assert!(
+            Cli::try_parse_from([
+                "swayshare",
+                "start",
+                "mike",
+                "--minutes",
+                "5",
+                "--no-expire"
+            ])
+            .is_err()
+        );
+    }
+}
