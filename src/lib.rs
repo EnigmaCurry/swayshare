@@ -11,10 +11,14 @@ pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod gate;
+#[cfg(feature = "gui")]
+pub mod gui;
+pub mod icon;
 pub mod identity;
 pub mod invite;
 pub mod ipc;
 pub mod notify;
 pub mod paths;
 pub mod secret;
+pub mod tray;
 pub mod wayvnc;

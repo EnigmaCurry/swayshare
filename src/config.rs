@@ -166,6 +166,22 @@ fn validate_peer_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Accept both a bare address and a CIDR, treating the former as a host route.
+///
+/// Typing `10.0.0.3` and silently getting a whole subnet would be the worst
+/// possible surprise here, so a bare address becomes an explicit /32 or /128.
+pub fn parse_cidr(input: &str) -> Result<IpNet> {
+    if let Ok(net) = input.parse::<IpNet>() {
+        // `IpNet` accepts a host address with non-zero bits outside the prefix
+        // (10.0.0.3/24); truncate so the stored range is unambiguous.
+        return Ok(net.trunc());
+    }
+    if let Ok(ip) = input.parse::<IpAddr>() {
+        return Ok(IpNet::from(ip));
+    }
+    bail!("'{input}' is not an IP address or CIDR range")
+}
+
 /// How broad a CIDR has to be before we refuse it without an explicit override.
 ///
 /// Anything wider than a /24 (or /120 for IPv6) almost certainly is not "one
@@ -239,6 +255,35 @@ pub fn resolve_listen_ip(net: &Network) -> Result<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_addresses_become_host_routes() {
+        assert_eq!(
+            parse_cidr("10.0.0.3").unwrap(),
+            "10.0.0.3/32".parse::<IpNet>().unwrap()
+        );
+        assert_eq!(
+            parse_cidr("fd00::3").unwrap(),
+            "fd00::3/128".parse::<IpNet>().unwrap()
+        );
+    }
+
+    #[test]
+    fn cidrs_are_truncated_to_their_prefix() {
+        // Otherwise "10.0.0.3/24" would read as one host but match 256.
+        assert_eq!(
+            parse_cidr("10.0.0.3/24").unwrap(),
+            "10.0.0.0/24".parse::<IpNet>().unwrap()
+        );
+    }
+
+    #[test]
+    fn nonsense_cidrs_are_rejected() {
+        assert!(parse_cidr("mike").is_err());
+        assert!(parse_cidr("10.0.0.300/32").is_err());
+        assert!(parse_cidr("10.0.0.3/33").is_err());
+        assert!(parse_cidr("").is_err());
+    }
 
     #[test]
     fn host_routes_do_not_warn() {

@@ -124,6 +124,45 @@ pub async fn request(socket: &Path, req: &Request) -> Result<Response> {
     serde_json::from_str(buf.trim_end()).context("decoding reply")
 }
 
+/// Synchronous client, for callers that have no tokio runtime.
+///
+/// The configuration window runs a GTK main loop rather than a reactor, so it
+/// talks to the daemon from worker threads using plain blocking sockets.
+pub mod blocking {
+    use super::{Request, Response};
+    use anyhow::{Context, Result, bail};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// Generous enough to cover a `Start` that waits on wayvnc coming up.
+    const TIMEOUT: Duration = Duration::from_secs(30);
+
+    pub fn request(socket: &Path, req: &Request) -> Result<Response> {
+        let mut stream = UnixStream::connect(socket).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                anyhow::anyhow!("the swayshare daemon is not running (try: swayshare daemon)")
+            }
+            _ => anyhow::Error::new(e).context(format!("connecting to {}", socket.display())),
+        })?;
+        stream.set_read_timeout(Some(TIMEOUT))?;
+        stream.set_write_timeout(Some(TIMEOUT))?;
+
+        let line = serde_json::to_string(req).context("encoding request")?;
+        stream.write_all(line.as_bytes())?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+
+        let mut reader = BufReader::new(stream);
+        let mut buf = String::new();
+        if reader.read_line(&mut buf).context("reading reply")? == 0 {
+            bail!("the daemon closed the connection without replying");
+        }
+        serde_json::from_str(buf.trim_end()).context("decoding reply")
+    }
+}
+
 /// Unwrap a response, turning the error variant into an `Err`.
 pub fn expect_ok(resp: Response) -> Result<Response> {
     match resp {

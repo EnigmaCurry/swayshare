@@ -39,8 +39,10 @@ the port over the tunnel.
 
 ## Status
 
-Milestone 1 of 3 is complete: a working CLI. The tray applet (milestone 2) and
-the configuration GUI (milestone 3) are not written yet.
+All three planned milestones are implemented: the CLI, the tray applet, and
+the GTK4 configuration window.
+
+![The configuration window with a session running](docs/configuration-window.png)
 
 ## Install
 
@@ -51,11 +53,18 @@ nix run github:enigmacurry/swayshare -- status      # try it
 nix profile install github:enigmacurry/swayshare    # keep it
 ```
 
+There are two packages: `swayshare` includes the GTK4 configuration window,
+and `swayshare-cli` is the same binary built without it, for machines that do
+not want GTK.
+
 From source — `wayvnc` 0.10 or newer must be on `PATH`:
 
 ```sh
+nix develop                      # provides GTK, wayvnc, and the test tooling
 cargo build --release
-nix develop            # or: nix shell nixpkgs#wayvnc
+
+# Without the configuration window, and therefore without needing GTK:
+cargo build --release --no-default-features
 ```
 
 ## Quickstart
@@ -94,6 +103,41 @@ session only, and only connections from your own address are
 accepted (10.0.0.3/32).
 Access expires automatically in 30m.
 ```
+
+### The tray applet
+
+```sh
+swayshare tray
+```
+
+The tray shows a monitor glyph that is grey when nothing is shared, amber once
+a peer is authorised, and red and filled while someone is actually connected.
+Its menu enables access for a peer, copies the invitation, stops sharing, and
+opens the configuration window. Quitting the tray revokes access and stops the
+daemon.
+
+It hosts a daemon itself when none is running, and attaches to one if there
+is. Because the icon is drawn in code rather than looked up in an icon theme,
+it cannot silently fail to appear for want of a theme icon; and because it
+keeps retrying to register, starting before your bar does is harmless.
+
+To autostart it from your Sway config:
+
+```
+exec swayshare tray
+```
+
+### The configuration window
+
+```sh
+swayshare gui
+```
+
+Add and remove peers, pick how long access should last, enable access for the
+selected peer, and copy the invitation. It talks to the same daemon as
+everything else, so a session started from the tray or the CLI shows up here
+too, invitation included. Closing the window leaves the tray and any running
+session alone.
 
 ### Sway keybindings
 
@@ -168,6 +212,9 @@ What swayshare guarantees:
   a real wayvnc.
 - **No privileges.** No root, no setuid, no firewall mutation. Access control
   is entirely in userspace, which is also why it is portable across distros.
+- **One set of rules.** The tray and the window are clients of the same
+  control socket as the CLI; neither has a privileged path of its own, and
+  neither can enable a peer the daemon would refuse.
 
 What it does **not** do:
 
@@ -183,22 +230,44 @@ What it does **not** do:
 ## Testing
 
 ```sh
-cargo test                     # unit + gate integration tests
-nix develop -c ./scripts/e2e-smoke.sh
+cargo test                            # unit, gate, and control-protocol tests
+nix develop -c ./scripts/e2e-smoke.sh   # the gate, against a real wayvnc
+nix develop -c ./scripts/tray-smoke.sh  # the tray, over a private D-Bus session
+nix develop -c ./scripts/gui-smoke.sh   # the window, under a headless Sway
 ```
 
-`scripts/e2e-smoke.sh` runs a real wayvnc on a headless Sway and checks the
-properties above end to end: that a VNC stream really traverses the gate, that
-authentication is enforced, that an unauthorised source receives no bytes at
-all, that stop revokes immediately, and that no credentials are left behind.
+- `e2e-smoke.sh` runs a real wayvnc on a headless Sway and checks that a VNC
+  stream really traverses the gate, that authentication is enforced (wayvnc
+  must not offer the "None" security type), that an unauthorised source
+  receives no bytes at all, that stop revokes immediately, and that no
+  credentials are left behind.
+- `tray-smoke.sh` runs the tray on a bus created by `dbus-run-session`, so it
+  never touches your real tray, and asserts over D-Bus that the item
+  registers, that its icon and `Status` track the session, that the menu
+  reflects the state, and that quitting revokes access and stops the daemon.
+- `gui-smoke.sh` opens the window on a headless Sway and checks that it maps,
+  renders, and follows the daemon's state. Note that a headless wlroots seat
+  has no input devices, so synthetic clicking is not possible there: the logic
+  behind each control is covered by unit and integration tests instead, and
+  this script covers the rendering and polling that those cannot reach.
 
 ## Roadmap
 
 1. **CLI** — done.
-2. **Tray applet** — a StatusNotifierItem (`ksni`) for Waybar: peer selection,
-   a connection indicator and one-click stop.
-3. **Configuration GUI** — GTK4 peer editor, invitation copying, expiry
-   settings.
+2. **Tray applet** — done: a StatusNotifierItem (`ksni`) for Waybar, with peer
+   selection, a connection indicator and one-click stop.
+3. **Configuration window** — done: a GTK4 peer editor with invitation
+   copying and expiry settings.
+
+Possible next steps:
+
+- Subscribe to daemon events over the control socket instead of polling once a
+  second, so the tray and window react instantly.
+- Use wayvnc's own control socket (`wayvncctl`) to expose per-viewer detail.
+  Note that it reports `address: null` for Unix-socket clients, so the gate
+  remains the only source of connection identity.
+- Let the window edit `network.interface` / `port`, which today still means
+  editing the config file.
 
 Deliberately out of scope: managing the WireGuard tunnel itself.
 

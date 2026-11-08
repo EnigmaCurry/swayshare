@@ -10,7 +10,6 @@ use crate::ipc::{self, Request, Response};
 use crate::paths;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use ipnet::IpNet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -71,6 +70,10 @@ enum Command {
     Invite,
     /// Run the supervisor in the foreground
     Daemon,
+    /// Run the tray applet (hosts a daemon if none is running)
+    Tray,
+    /// Open the configuration window
+    Gui,
     /// Stop sharing and exit the running daemon
     Quit,
     /// Print the config file path
@@ -107,6 +110,8 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Status { json } => status(json).await,
         Command::Invite => show_invite().await,
         Command::Daemon => Daemon::run().await,
+        Command::Tray => crate::tray::run().await,
+        Command::Gui => run_gui(),
         Command::Quit => simple(Request::Shutdown, "Daemon stopped.").await,
         Command::ConfigPath => {
             println!("{}", paths::config_file()?.display());
@@ -115,8 +120,23 @@ async fn dispatch(command: Command) -> Result<()> {
     }
 }
 
+/// The configuration window is optional at compile time, so a build without
+/// it fails with an explanation rather than an unknown subcommand.
+#[cfg(feature = "gui")]
+fn run_gui() -> Result<()> {
+    crate::gui::run()
+}
+
+#[cfg(not(feature = "gui"))]
+fn run_gui() -> Result<()> {
+    bail!(
+        "this swayshare was built without the configuration window \
+         (rebuild with the default features to enable it)"
+    )
+}
+
 fn add_peer(name: &str, cidr: &str, force: bool) -> Result<()> {
-    let parsed = parse_cidr(cidr)?;
+    let parsed = config::parse_cidr(cidr)?;
     if let Some(warning) = config::breadth_warning(&parsed) {
         if config::requires_force(&parsed) && !force {
             bail!("{warning}\nRe-run with --force if that is really what you want.");
@@ -129,22 +149,6 @@ fn add_peer(name: &str, cidr: &str, force: bool) -> Result<()> {
     cfg.save()?;
     println!("Added peer {name} ({parsed}).");
     Ok(())
-}
-
-/// Accept both a bare address and a CIDR, treating the former as a host route.
-///
-/// Typing `10.0.0.3` and silently getting a whole subnet would be the worst
-/// possible surprise here, so a bare address becomes an explicit /32 or /128.
-fn parse_cidr(input: &str) -> Result<IpNet> {
-    if let Ok(net) = input.parse::<IpNet>() {
-        // `IpNet` accepts a host address with non-zero bits outside the prefix
-        // (10.0.0.3/24); truncate so the stored range is unambiguous.
-        return Ok(net.trunc());
-    }
-    if let Ok(ip) = input.parse::<std::net::IpAddr>() {
-        return Ok(IpNet::from(ip));
-    }
-    bail!("'{input}' is not an IP address or CIDR range")
 }
 
 fn remove_peer(name: &str) -> Result<()> {
@@ -285,35 +289,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bare_addresses_become_host_routes() {
-        assert_eq!(
-            parse_cidr("10.0.0.3").unwrap(),
-            "10.0.0.3/32".parse::<IpNet>().unwrap()
-        );
-        assert_eq!(
-            parse_cidr("fd00::3").unwrap(),
-            "fd00::3/128".parse::<IpNet>().unwrap()
-        );
-    }
-
-    #[test]
-    fn cidrs_are_truncated_to_their_prefix() {
-        // Otherwise "10.0.0.3/24" would read as one host but match 256.
-        assert_eq!(
-            parse_cidr("10.0.0.3/24").unwrap(),
-            "10.0.0.0/24".parse::<IpNet>().unwrap()
-        );
-    }
-
-    #[test]
-    fn nonsense_is_rejected() {
-        assert!(parse_cidr("mike").is_err());
-        assert!(parse_cidr("10.0.0.300/32").is_err());
-        assert!(parse_cidr("10.0.0.3/33").is_err());
-        assert!(parse_cidr("").is_err());
-    }
-
-    #[test]
     fn cli_parses_the_documented_invocations() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
@@ -331,6 +306,8 @@ mod tests {
         }
 
         assert!(Cli::try_parse_from(["swayshare", "status"]).is_ok());
+        assert!(Cli::try_parse_from(["swayshare", "tray"]).is_ok());
+        assert!(Cli::try_parse_from(["swayshare", "gui"]).is_ok());
         assert!(Cli::try_parse_from(["swayshare", "stop"]).is_ok());
         // --minutes and --no-expire are contradictory.
         assert!(
