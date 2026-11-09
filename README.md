@@ -172,7 +172,7 @@ accepted (10.0.0.3/32). Access expires automatically in 30m.
 
 **The password is a one-time secret, spoken not pasted.** There is no stored
 or static password. The moment someone connects, swayshare mints a short word
-passphrase (e.g. `flip-mock-army-zero`) and pops it up on *your* screen
+passphrase (e.g. `flip mock army zero`) and pops it up on *your* screen
 alongside the connecting address; you read it to the person on the phone and
 they type it in. It is rotated the instant they disconnect, so a secret said
 once can never be reused for a later connection. The word count is

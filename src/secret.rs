@@ -21,8 +21,8 @@ const LEN: usize = 26;
 /// line is the intended way to hand over a session password.
 ///
 /// Source: <https://www.eff.org/dice>, by the Electronic Frontier Foundation,
-/// released under CC-BY 3.0. The single entry containing a hyphen (`yo-yo`),
-/// which would clash with the passphrase separator, is the one local edit.
+/// released under CC-BY 3.0. The single hyphenated entry (`yo-yo`) is the one
+/// local edit, replaced so every word is plain lowercase letters.
 const WORDLIST: &str = include_str!("wordlist.txt");
 
 /// Words joined into one passphrase. Four words of 1296 is ~41 bits, which -
@@ -31,7 +31,9 @@ const WORDLIST: &str = include_str!("wordlist.txt");
 pub const DEFAULT_WORDS: usize = 4;
 /// Guard against a config that would make the secret trivial to guess.
 const MIN_WORDS: usize = 3;
-const SEPARATOR: char = '-';
+/// A plain space: it reads most naturally aloud and VNC passwords may contain
+/// one. Every wordlist entry is pure letters, so words stay unambiguous.
+const SEPARATOR: char = ' ';
 
 /// A password that is zeroized on drop and never printed by accident.
 ///
