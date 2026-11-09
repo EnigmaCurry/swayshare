@@ -4,6 +4,15 @@
 //! whether sharing starts or stops.
 
 use crate::ipc::AccessMode;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Server-assigned id of the last notification we posted, or 0 for none yet.
+///
+/// Reusing it as the next notification's `replaces_id` makes the series
+/// collapse into a single, updating bubble instead of a growing stack: the
+/// events swayshare reports (connecting, authenticated, disconnected) are a
+/// timeline where only the latest state matters.
+static LAST_ID: AtomicU32 = AtomicU32::new(0);
 
 fn send(summary: String, body: String, critical: bool) {
     // notify-rust talks D-Bus synchronously; keep it off the event loop.
@@ -13,10 +22,19 @@ fn send(summary: String, body: String, critical: bool) {
             .body(&body)
             .appname("swayshare")
             .icon("video-display");
+        // Replace the previous bubble rather than add to it. A stale id (its
+        // notification already dismissed) is harmless: the server just posts a
+        // fresh one.
+        let prev = LAST_ID.load(Ordering::Relaxed);
+        if prev != 0 {
+            n.id(prev);
+        }
         if critical {
             n.urgency(notify_rust::Urgency::Critical);
         }
-        let _ = n.show();
+        if let Ok(handle) = n.show() {
+            LAST_ID.store(handle.id(), Ordering::Relaxed);
+        }
     });
 }
 
