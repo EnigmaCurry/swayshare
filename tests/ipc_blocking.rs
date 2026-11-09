@@ -120,6 +120,7 @@ fn daemon_errors_surface_as_rust_errors() {
         &Request::Start {
             peer: "nobody".into(),
             minutes: None,
+            mode: Default::default(),
         },
     )
     .and_then(ipc::expect_ok);

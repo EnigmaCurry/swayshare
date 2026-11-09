@@ -26,10 +26,14 @@ command -v busctl >/dev/null || { echo "busctl is required"; exit 1; }
 command -v dbus-run-session >/dev/null || { echo "dbus-run-session is required"; exit 1; }
 
 # Everything below runs inside a private bus.
-exec dbus-run-session -- bash -s "$BIN" "$PORT" <<'INNER'
+CLIENT=$(realpath "$(dirname "$0")/vnc_client.py")
+
+exec dbus-run-session -- bash -s "$BIN" "$PORT" "$CLIENT" <<'INNER'
 set -u
 BIN=$1
 PORT=$2
+# Passed in because $0 is "bash" inside `bash -s`, so dirname would be wrong.
+CLIENT=$3
 FAILURES=0
 pass() { echo "  PASS: $*"; }
 fail() { echo "  FAIL: $*"; FAILURES=$((FAILURES + 1)); }
@@ -127,8 +131,10 @@ if [ -z "$LAYOUT_OFF" ]; then
 else
   echo "$LAYOUT_OFF" | grep -q "Remote access off" && pass "menu header says 'Remote access off'" \
     || fail "menu header missing"
-  echo "$LAYOUT_OFF" | grep -q "Enable access for" && pass "peer submenu present" \
-    || fail "peer submenu missing"
+  echo "$LAYOUT_OFF" | grep -q "Hand the controls to" \
+    && pass "full-control submenu present" || fail "full-control submenu missing"
+  echo "$LAYOUT_OFF" | grep -q "Grant view-only access to" \
+    && pass "view-only submenu present" || fail "view-only submenu missing"
   echo "$LAYOUT_OFF" | grep -q "tester" && pass "configured peer is listed" \
     || fail "peer 'tester' not listed"
   echo "$LAYOUT_OFF" | grep -q "revokes access" && pass "quit warns about revocation" \
@@ -169,6 +175,30 @@ PY
   echo "$(menu_layout)" | grep -q "has the controls" \
     && pass "menu says who has the controls" || fail "menu did not report the connected peer"
   wait $VIEWER 2>/dev/null
+
+  echo "== a view-only session must look different from a control session =="
+  "$BIN" stop >/dev/null 2>&1
+  sleep 1.5
+  "$BIN" start tester --minutes 5 --view-only >/dev/null 2>&1 \
+    || fail "could not start a view-only session"
+  sleep 2.5
+  ICON_VIEW_WAIT=$(icon_digest)
+  python3 "$CLIENT" --port "$PORT" \
+    --password "$("$BIN" invite | grep '^Password:' | awk '{print $2}')" \
+    --ca "$XDG_DATA_HOME/swayshare/tls/cert.pem" --hold 6 >/dev/null 2>&1 &
+  VIEWER2=$!
+  sleep 3
+  ICON_VIEW_CONN=$(icon_digest)
+  [ "$ICON_VIEW_CONN" != "$ICON_CONN" ] \
+    && pass "connected view-only icon differs from connected-with-control ($ICON_VIEW_CONN)" \
+    || fail "view-only and full control look identical in the tray"
+  [ "$ICON_VIEW_CONN" != "$ICON_VIEW_WAIT" ] \
+    && pass "the icon still changes on connect in view-only mode" \
+    || fail "the icon did not change when the view-only peer connected"
+  echo "$(menu_layout)" | grep -q "is watching" \
+    && pass "menu says they are watching, not driving" \
+    || fail "menu did not distinguish watching from driving"
+  wait $VIEWER2 2>/dev/null
 
   echo "== stop =="
   "$BIN" stop >/dev/null 2>&1

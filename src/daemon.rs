@@ -9,7 +9,7 @@ use crate::config::{self, Config, Peer};
 use crate::gate::{self, Decision, GateEvent, Revoker};
 use crate::identity::Identity;
 use crate::invite;
-use crate::ipc::{Request, Response, Session, State, Status};
+use crate::ipc::{AccessMode, Request, Response, Session, State, Status};
 use crate::notify;
 use crate::paths;
 use crate::secret::Secret;
@@ -34,6 +34,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 struct ActiveSession {
     peer: Peer,
     listen: SocketAddr,
+    /// Fixed for the life of the session; see [`AccessMode`].
+    mode: AccessMode,
     username: String,
     password: Secret,
     fingerprint: String,
@@ -134,7 +136,11 @@ impl Daemon {
     async fn handle(&mut self, req: Request) -> Response {
         let result = match req {
             Request::Status => Ok(Response::Status(self.status())),
-            Request::Start { peer, minutes } => self.start_session(&peer, minutes).await,
+            Request::Start {
+                peer,
+                minutes,
+                mode,
+            } => self.start_session(&peer, minutes, mode).await,
             Request::Stop => {
                 if self.session.is_none() {
                     Err(anyhow::anyhow!("sharing is already off"))
@@ -170,6 +176,7 @@ impl Daemon {
                 cidr: Some(s.peer.cidr.to_string()),
                 listen: Some(s.listen.to_string()),
                 connections: s.connections,
+                mode: Some(s.mode),
                 expires_in_seconds: s.remaining_seconds(),
             },
         }
@@ -186,7 +193,12 @@ impl Daemon {
     ///
     /// Any existing session is torn down first: switching peers must never
     /// leave the previous peer's access in place.
-    async fn start_session(&mut self, peer_name: &str, minutes: Option<u64>) -> Result<Response> {
+    async fn start_session(
+        &mut self,
+        peer_name: &str,
+        minutes: Option<u64>,
+        mode: AccessMode,
+    ) -> Result<Response> {
         let cfg = Config::load()?;
         let peer = cfg
             .find_peer(peer_name)
@@ -214,8 +226,14 @@ impl Daemon {
         let password = Secret::generate()?;
         let username = cfg.security.username.clone();
 
-        let mut wayvnc =
-            Wayvnc::spawn(&self.runtime_dir, &username, &password, &self.identity).await?;
+        let mut wayvnc = Wayvnc::spawn(
+            &self.runtime_dir,
+            &username,
+            &password,
+            &self.identity,
+            mode,
+        )
+        .await?;
 
         let listener = match gate::bind(listen).await {
             Ok(l) => l,
@@ -275,6 +293,7 @@ impl Daemon {
         let session = ActiveSession {
             peer,
             listen,
+            mode,
             username,
             password,
             fingerprint: self.identity.fingerprint.clone(),
@@ -286,10 +305,17 @@ impl Daemon {
         };
 
         eprintln!(
-            "swayshare: listening on {} for {} ({})",
-            session.listen, session.peer.name, session.peer.cidr
+            "swayshare: listening on {} for {} ({}, {})",
+            session.listen,
+            session.peer.name,
+            session.peer.cidr,
+            session.mode.label()
         );
-        notify::session_started(&session.peer.name, &session.listen.to_string());
+        notify::session_started(
+            &session.peer.name,
+            &session.listen.to_string(),
+            session.mode,
+        );
 
         let described = session.describe();
         self.session = Some(session);
@@ -322,15 +348,18 @@ impl Daemon {
             Event::Gate(GateEvent::Accepted { ip, active }) => {
                 if let Some(s) = &mut self.session {
                     s.connections = active;
-                    eprintln!("swayshare: {ip} connected ({active} active)");
-                    notify::client_connected(&s.peer.name, &ip.to_string());
+                    eprintln!(
+                        "swayshare: {ip} connected ({active} active, {})",
+                        s.mode.label()
+                    );
+                    notify::client_connected(&s.peer.name, &ip.to_string(), s.mode);
                 }
             }
             Event::Gate(GateEvent::Closed { ip, active }) => {
                 if let Some(s) = &mut self.session {
                     s.connections = active;
                     eprintln!("swayshare: {ip} disconnected ({active} active)");
-                    notify::client_disconnected(&s.peer.name);
+                    notify::client_disconnected(&s.peer.name, s.mode);
                 }
             }
             Event::Gate(GateEvent::Rejected { ip, decision }) => {
@@ -369,6 +398,7 @@ impl ActiveSession {
             username: self.username.clone(),
             password: self.password.expose().to_string(),
             fingerprint: self.fingerprint.clone(),
+            mode: self.mode,
             expires_in_seconds: self.remaining_seconds(),
         }
     }
@@ -463,10 +493,16 @@ pub fn render_status(status: &Status) -> String {
     match status.state {
         State::Off => out.push_str("Remote access is off\n"),
         State::Listening => out.push_str("Access granted - waiting for them to connect\n"),
-        State::Connected => out.push_str("Someone is controlling your desktop\n"),
+        State::Connected => match status.mode {
+            Some(AccessMode::ViewOnly) => out.push_str("Someone is watching your screen\n"),
+            _ => out.push_str("Someone is controlling your desktop\n"),
+        },
     }
     if let (Some(peer), Some(cidr)) = (&status.peer, &status.cidr) {
         out.push_str(&format!("  Peer:        {peer} ({cidr})\n"));
+    }
+    if let Some(mode) = status.mode {
+        out.push_str(&format!("  Access:      {}\n", mode.label()));
     }
     if let Some(listen) = &status.listen {
         out.push_str(&format!("  Listening:   {listen}\n"));

@@ -1,6 +1,6 @@
 //! Rendering of the invitation the user sends to their helper.
 
-use crate::ipc::Session;
+use crate::ipc::{AccessMode, Session};
 
 /// Format the connection details as a block the user can paste into a chat.
 ///
@@ -16,15 +16,22 @@ pub fn render(session: &Session) -> String {
     out.push_str(&format!("Password: {}\n", session.password));
     out.push_str(&format!("TLS cert: SHA256:{}\n", session.fingerprint));
     out.push('\n');
-    // Say plainly what the recipient is being handed: they will be driving a
-    // live desktop, not watching a stream of one.
-    out.push_str("You will have full control of the screen, keyboard and pointer,\n");
-    out.push_str("at the same time as me. Connect through the VPN tunnel. The\n");
-    out.push_str("password is valid for this session only, and only connections\n");
-    out.push_str(&format!(
-        "from your own address are accepted ({}).\n",
-        session.cidr
-    ));
+    // Say plainly what the recipient is being handed, so they know whether
+    // they are driving or watching before they connect.
+    match session.mode {
+        AccessMode::Control => {
+            out.push_str("You will have full control of the screen, keyboard and pointer,\n");
+            out.push_str("at the same time as me.\n");
+        }
+        AccessMode::ViewOnly => {
+            out.push_str("This is a view-only session: you will see my screen, but\n");
+            out.push_str("your keyboard and mouse will not reach it.\n");
+        }
+    }
+    out.push('\n');
+    out.push_str("Connect through the VPN tunnel. The password is valid for\n");
+    out.push_str("this session only, and only connections from your own address\n");
+    out.push_str(&format!("are accepted ({}).\n", session.cidr));
     if let Some(secs) = session.expires_in_seconds {
         out.push_str(&format!(
             "Access expires automatically in {}.\n",
@@ -63,6 +70,7 @@ mod tests {
             username: "support".into(),
             password: "ABCDEFGH".into(),
             fingerprint: "AA:BB:CC".into(),
+            mode: AccessMode::Control,
             expires_in_seconds: Some(3600),
         }
     }
@@ -76,6 +84,29 @@ mod tests {
         assert!(text.contains("SHA256:AA:BB:CC"));
         assert!(text.contains("10.0.0.3/32"));
         assert!(text.contains("expires automatically in 1h"));
+    }
+
+    #[test]
+    fn the_invitation_says_whether_they_can_type() {
+        let control = render(&session());
+        assert!(
+            control.contains("full control"),
+            "a control invitation must say so: {control}"
+        );
+        assert!(!control.contains("view-only"));
+
+        let mut view = session();
+        view.mode = AccessMode::ViewOnly;
+        let text = render(&view);
+        assert!(
+            text.contains("view-only"),
+            "a view-only invitation must say so: {text}"
+        );
+        assert!(
+            text.contains("will not reach"),
+            "it should be explicit that their input is dropped: {text}"
+        );
+        assert!(!text.contains("full control"));
     }
 
     #[test]

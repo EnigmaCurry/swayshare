@@ -13,7 +13,7 @@
 
 use crate::config::{self, Config, Peer};
 use crate::invite;
-use crate::ipc::{self, Request, Response, Session, State, Status};
+use crate::ipc::{self, AccessMode, Request, Response, Session, State, Status};
 use crate::paths;
 use anyhow::Result;
 use gtk::prelude::*;
@@ -49,6 +49,8 @@ struct Ui {
     name_entry: gtk::Entry,
     cidr_entry: gtk::Entry,
     minutes: gtk::SpinButton,
+    /// Ticked to grant a session the peer cannot type into.
+    view_only: gtk::CheckButton,
     enable_button: gtk::Button,
     stop_button: gtk::Button,
     copy_button: gtk::Button,
@@ -113,6 +115,7 @@ fn build_window(app: &gtk::Application) {
             .hexpand(true)
             .build(),
         minutes: gtk::SpinButton::with_range(0.0, 1440.0, 5.0),
+        view_only: gtk::CheckButton::with_label("View only"),
         enable_button: gtk::Button::with_label("Enable access"),
         stop_button: gtk::Button::with_label("Revoke access"),
         copy_button: gtk::Button::with_label("Copy invitation"),
@@ -276,6 +279,7 @@ fn layout(ui: &Rc<Ui>) -> gtk::Box {
         .build();
     grant_box.append(&gtk::Label::new(Some("Minutes:")));
     grant_box.append(&ui.minutes);
+    grant_box.append(&ui.view_only);
     grant_box.append(&gtk::Box::builder().hexpand(true).build());
     grant_box.append(&ui.enable_button);
     root.append(
@@ -478,6 +482,13 @@ fn enable_access(ui: &Rc<Ui>) {
         return set_message(ui, "Select a peer first.", true);
     };
     let minutes = ui.minutes.value().round() as u64;
+    // Fixed for the life of the session: wayvnc takes --disable-input only at
+    // startup, so this cannot be changed later without disconnecting them.
+    let mode = if ui.view_only.is_active() {
+        AccessMode::ViewOnly
+    } else {
+        AccessMode::Control
+    };
 
     // Remember the chosen duration, so the CLI and tray agree with the window.
     if let Ok(mut cfg) = Config::load()
@@ -489,7 +500,7 @@ fn enable_access(ui: &Rc<Ui>) {
 
     set_message(
         ui,
-        &format!("Starting a session for {}...", peer.name),
+        &format!("Starting a {} session for {}...", mode.label(), peer.name),
         false,
     );
     ui.enable_button.set_sensitive(false);
@@ -498,6 +509,7 @@ fn enable_access(ui: &Rc<Ui>) {
         Request::Start {
             peer: peer.name,
             minutes: Some(minutes),
+            mode,
         },
         |response| match response {
             Response::Session(session) => UiEvent::Started(session),
@@ -585,7 +597,10 @@ fn render_status(ui: &Rc<Ui>, status: &Status) {
     ui.state_label.set_label(match status.state {
         State::Off => "Remote access off",
         State::Listening => "Access granted - waiting for them to connect",
-        State::Connected => "Someone is controlling your desktop",
+        State::Connected => match status.mode {
+            Some(AccessMode::ViewOnly) => "Someone is watching your screen",
+            _ => "Someone is controlling your desktop",
+        },
     });
 
     let mut detail = String::new();
@@ -594,6 +609,9 @@ fn render_status(ui: &Rc<Ui>, status: &Status) {
     }
     if let Some(listen) = &status.listen {
         detail.push_str(&format!("\nListening on {listen}"));
+    }
+    if let Some(mode) = status.mode {
+        detail.push_str(&format!("\nAccess: {}", mode.label()));
     }
     if let Some(secs) = status.expires_in_seconds {
         detail.push_str(&format!("\nExpires in {}", invite::humanize(secs)));

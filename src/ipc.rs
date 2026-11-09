@@ -10,6 +10,46 @@ use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+/// What the authorised peer is allowed to do once connected.
+///
+/// Chosen when access is granted and fixed for the life of the session.
+/// wayvnc takes `--disable-input` at startup and offers no way to change it
+/// afterwards, so a mid-session switch would mean restarting wayvnc and
+/// dropping the peer's connection. Rather than ship a toggle that
+/// disconnects, the choice is made up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccessMode {
+    /// The peer's keyboard and pointer are injected into your session.
+    #[default]
+    Control,
+    /// Frames go out; nothing comes back in.
+    ViewOnly,
+}
+
+impl AccessMode {
+    pub fn is_view_only(self) -> bool {
+        matches!(self, AccessMode::ViewOnly)
+    }
+
+    /// Short phrase for menus and status lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            AccessMode::Control => "full control",
+            AccessMode::ViewOnly => "view only",
+        }
+    }
+}
+
+impl std::fmt::Display for AccessMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AccessMode::Control => "control",
+            AccessMode::ViewOnly => "view-only",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case")]
 pub enum Request {
@@ -18,6 +58,10 @@ pub enum Request {
         peer: String,
         /// Session length in minutes; `Some(0)` means no expiry.
         minutes: Option<u64>,
+        /// Defaulted so an older client that omits it still means "control",
+        /// which is what it would have got before this field existed.
+        #[serde(default)]
+        mode: AccessMode,
     },
     Stop,
     /// Re-print the invitation for the running session.
@@ -66,6 +110,9 @@ pub struct Status {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
     pub connections: usize,
+    /// `None` only when nothing is shared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<AccessMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_in_seconds: Option<u64>,
 }
@@ -78,6 +125,7 @@ impl Status {
             cidr: None,
             listen: None,
             connections: 0,
+            mode: None,
             expires_in_seconds: None,
         }
     }
@@ -94,6 +142,7 @@ pub struct Session {
     pub username: String,
     pub password: String,
     pub fingerprint: String,
+    pub mode: AccessMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_in_seconds: Option<u64>,
 }
@@ -182,10 +231,12 @@ mod tests {
             Request::Start {
                 peer: "mike".into(),
                 minutes: Some(30),
+                mode: AccessMode::Control,
             },
             Request::Start {
                 peer: "mike".into(),
                 minutes: None,
+                mode: AccessMode::ViewOnly,
             },
             Request::Stop,
             Request::Invite,
@@ -195,6 +246,33 @@ mod tests {
             assert!(!text.contains('\n'), "requests must stay on one line");
             let back: Request = serde_json::from_str(&text).unwrap();
             assert_eq!(format!("{req:?}"), format!("{back:?}"));
+        }
+    }
+
+    #[test]
+    fn a_start_without_a_mode_defaults_to_control() {
+        // An older client that does not know about view-only gets exactly the
+        // behaviour it would have got before the field existed.
+        let req: Request =
+            serde_json::from_str(r#"{"command":"start","peer":"mike","minutes":30}"#).unwrap();
+        match req {
+            Request::Start { mode, .. } => assert_eq!(mode, AccessMode::Control),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_mode_survives_the_wire() {
+        let req = Request::Start {
+            peer: "mike".into(),
+            minutes: None,
+            mode: AccessMode::ViewOnly,
+        };
+        let text = serde_json::to_string(&req).unwrap();
+        assert!(text.contains("view-only"), "got: {text}");
+        match serde_json::from_str::<Request>(&text).unwrap() {
+            Request::Start { mode, .. } => assert_eq!(mode, AccessMode::ViewOnly),
+            other => panic!("unexpected: {other:?}"),
         }
     }
 
@@ -214,6 +292,7 @@ mod tests {
             cidr: Some("10.0.0.3/32".into()),
             listen: Some("10.0.0.10:5900".into()),
             connections: 1,
+            mode: Some(AccessMode::ViewOnly),
             expires_in_seconds: Some(1800),
         });
         let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();

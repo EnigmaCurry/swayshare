@@ -40,7 +40,13 @@ command -v sway   >/dev/null || { echo "sway not on PATH"; exit 1; }
 [ -x "$BIN" ] || { echo "no swayshare binary at $BIN; run cargo build first"; exit 1; }
 
 echo "== starting a headless sway =="
-echo "set \$mod Mod4" > "$SB/sway.conf"
+# A binding that leaves a trace on disk whenever the keysym 'a' reaches the
+# compositor. This is how we tell real input injection from a flag that was
+# merely passed to wayvnc.
+cat > "$SB/sway.conf" <<EOF
+set \$mod Mod4
+bindsym a exec touch $SB/KEY_ARRIVED
+EOF
 WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
   sway --config "$SB/sway.conf" > "$SB/sway.log" 2>&1 &
 SWAY_PID=$!
@@ -133,6 +139,55 @@ finally:
     s.close()
 PY
 [ $? -eq 0 ] || FAILURES=$((FAILURES + 1))
+
+echo "== a real client authenticates and its input reaches the desktop =="
+CA="$XDG_DATA_HOME/swayshare/tls/cert.pem"
+PASSWORD=$(grep '^Password:' "$SB/invite.txt" | awk '{print $2}')
+CLIENT="$(dirname "$0")/vnc_client.py"
+rm -f "$SB/KEY_ARRIVED"
+if python3 "$CLIENT" --port "$PORT" --password "$PASSWORD" --ca "$CA" \
+     --send-key 0x61 --repeat 3 --hold 1 > "$SB/client.log" 2>&1; then
+  pass "VeNCrypt session completed, certificate verified against our own cert"
+else
+  fail "the authenticated session failed: $(tail -2 "$SB/client.log")"
+fi
+sleep 1.5
+[ -e "$SB/KEY_ARRIVED" ] \
+  && pass "the remote key press reached Sway (full control works)" \
+  || fail "a control session did not deliver input to the compositor"
+
+echo "== the wrong password is refused =="
+if python3 "$CLIENT" --port "$PORT" --password WRONGWRONGWRONGWRONGWRONG0 --ca "$CA" \
+     --expect-auth-failure > "$SB/badpw.log" 2>&1; then
+  pass "a bad password is rejected"
+else
+  fail "bad-password handling is wrong: $(tail -2 "$SB/badpw.log")"
+fi
+
+echo "== a view-only session connects but cannot type =="
+"$BIN" stop >/dev/null 2>&1
+sleep 0.5
+"$BIN" start tester --minutes 5 --view-only > "$SB/invite-view.txt" 2>&1 \
+  || fail "could not start a view-only session"
+grep -q "view-only" "$SB/invite-view.txt" \
+  && pass "the invitation tells the recipient it is view-only" \
+  || fail "the view-only invitation does not say so"
+MODE=$("$BIN" status --json | python3 -c 'import json,sys; print(json.load(sys.stdin).get("mode"))')
+[ "$MODE" = "view-only" ] && pass "the daemon reports mode=view-only" \
+  || fail "expected mode=view-only, got: $MODE"
+
+VIEW_PASSWORD=$(grep '^Password:' "$SB/invite-view.txt" | awk '{print $2}')
+rm -f "$SB/KEY_ARRIVED"
+if python3 "$CLIENT" --port "$PORT" --password "$VIEW_PASSWORD" --ca "$CA" \
+     --send-key 0x61 --repeat 3 --hold 1 > "$SB/client-view.log" 2>&1; then
+  pass "the view-only session still connects and shows the desktop"
+else
+  fail "the view-only session would not connect: $(tail -2 "$SB/client-view.log")"
+fi
+sleep 1.5
+[ -e "$SB/KEY_ARRIVED" ] \
+  && fail "a view-only session delivered a key press to the compositor" \
+  || pass "the key press was dropped - view-only really is view-only"
 
 echo "== stop revokes immediately =="
 "$BIN" stop >/dev/null

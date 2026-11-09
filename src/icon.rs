@@ -2,47 +2,87 @@
 //!
 //! A themed icon name is only as good as the theme the user happens to have;
 //! a missing name means a missing tray icon, which for this application would
-//! mean no visible indication that the screen is being shared. Drawing the
-//! glyph ourselves makes the indicator unconditional, and lets the colour
-//! carry the state.
+//! mean no visible indication that someone else is on the desktop. Drawing the
+//! glyph ourselves makes the indicator unconditional.
+//!
+//! Four states are distinguished by **shape as well as colour**, so the two
+//! that matter most - whether anyone is connected, and whether they can type -
+//! are still readable without colour discrimination.
 
-use crate::ipc::State;
+use crate::ipc::{AccessMode, State, Status};
 
 /// Tray icons are requested at 22px by most hosts; 24 divides more cleanly.
 const SIZE: i32 = 24;
 
-/// Colour per state, as 0xRRGGBB.
-///
-/// Deliberately distinguishable by brightness as well as hue, so the state is
-/// still readable for a user who cannot separate amber from red.
-const OFF: u32 = 0x9a_a0_a6; // grey: nothing is shared
-const LISTENING: u32 = 0xf5_a6_23; // amber: armed, waiting
-const CONNECTED: u32 = 0xe5_39_35; // red: someone is watching
+/// What the tray is currently telling the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Indicator {
+    /// Nobody has access.
+    Off,
+    /// A peer is authorised but has not connected yet.
+    Waiting,
+    /// Connected, view only: they can see but not type.
+    Watching,
+    /// Connected with keyboard and pointer control.
+    Controlling,
+}
 
-pub fn colour_for(state: State) -> u32 {
-    match state {
-        State::Off => OFF,
-        State::Listening => LISTENING,
-        State::Connected => CONNECTED,
+impl Indicator {
+    pub fn from_status(status: &Status) -> Self {
+        match (status.state, status.mode) {
+            (State::Off, _) => Indicator::Off,
+            (State::Listening, _) => Indicator::Waiting,
+            (State::Connected, Some(AccessMode::ViewOnly)) => Indicator::Watching,
+            (State::Connected, _) => Indicator::Controlling,
+        }
+    }
+
+    /// True while another person is on the desktop, in either mode.
+    pub fn is_connected(self) -> bool {
+        matches!(self, Indicator::Watching | Indicator::Controlling)
+    }
+
+    /// Colour as 0xRRGGBB. Chosen to differ in brightness as well as hue.
+    fn colour(self) -> u32 {
+        match self {
+            Indicator::Off => 0x9a_a0_a6,         // grey
+            Indicator::Waiting => 0xf5_a6_23,     // amber
+            Indicator::Watching => 0x42_8f_f5,    // blue
+            Indicator::Controlling => 0xe5_39_35, // red
+        }
+    }
+
+    fn fill(self) -> Fill {
+        match self {
+            // Nobody is connected: an empty screen.
+            Indicator::Off | Indicator::Waiting => Fill::Hollow,
+            // Someone is looking: an eye in the middle of the screen.
+            Indicator::Watching => Fill::Dot,
+            // Someone is driving: the screen is solid.
+            Indicator::Controlling => Fill::Solid,
+        }
     }
 }
 
-/// Render the tray glyph for `state`.
-///
-/// The glyph is a monitor outline; when someone is connected it is filled, so
-/// the "being watched" state reads differently in shape as well as colour.
-pub fn render(state: State) -> ksni::Icon {
-    let colour = colour_for(state);
-    let filled = matches!(state, State::Connected);
+/// How the interior of the monitor glyph is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    Hollow,
+    Dot,
+    Solid,
+}
+
+/// Render the tray glyph for `indicator`.
+pub fn render(indicator: Indicator) -> ksni::Icon {
     ksni::Icon {
         width: SIZE,
         height: SIZE,
-        data: draw(SIZE, colour, filled),
+        data: draw(SIZE, indicator.colour(), indicator.fill()),
     }
 }
 
 /// Produce ARGB32 pixels in network byte order, i.e. `[A, R, G, B]`.
-fn draw(size: i32, colour: u32, filled: bool) -> Vec<u8> {
+fn draw(size: i32, colour: u32, fill: Fill) -> Vec<u8> {
     let mut data = vec![0u8; (size * size * 4) as usize];
 
     // Screen body, inset to leave room for the stand below it.
@@ -59,6 +99,11 @@ fn draw(size: i32, colour: u32, filled: bool) -> Vec<u8> {
     let foot_right = right - 3;
     let foot_top = size - 4;
 
+    // Centre of the screen area, for the "watching" dot.
+    let cx = (left + right) / 2;
+    let cy = (top + bottom) / 2;
+    let dot_radius_sq = 9; // a 3px-radius disc
+
     for y in 0..size {
         for x in 0..size {
             let in_screen = x >= left && x <= right && y >= top && y <= bottom;
@@ -69,12 +114,23 @@ fn draw(size: i32, colour: u32, filled: bool) -> Vec<u8> {
                     || y > bottom - border);
             let in_neck = x >= neck_left && x <= neck_right && y > bottom && y < foot_top;
             let in_foot = x >= foot_left && x <= foot_right && y >= foot_top && y < size - 1;
+            let in_dot = {
+                let (dx, dy) = (x - cx, y - cy);
+                dx * dx + dy * dy <= dot_radius_sq
+            };
 
-            let alpha: u8 = if in_screen_border || in_neck || in_foot {
+            let solid_interior = in_screen
+                && !in_screen_border
+                && match fill {
+                    Fill::Solid => true,
+                    Fill::Dot => in_dot,
+                    Fill::Hollow => false,
+                };
+
+            let alpha: u8 = if in_screen_border || in_neck || in_foot || solid_interior {
                 0xff
             } else if in_screen {
-                // The interior is a wash when idle and solid when connected.
-                if filled { 0xff } else { 0x3a }
+                0x3a // a wash, so the glyph still reads as a screen
             } else {
                 0x00
             };
@@ -96,6 +152,13 @@ fn draw(size: i32, colour: u32, filled: bool) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    const ALL: [Indicator; 4] = [
+        Indicator::Off,
+        Indicator::Waiting,
+        Indicator::Watching,
+        Indicator::Controlling,
+    ];
+
     fn pixel(icon: &ksni::Icon, x: i32, y: i32) -> (u8, u8, u8, u8) {
         let i = ((y * icon.width + x) * 4) as usize;
         (
@@ -106,10 +169,22 @@ mod tests {
         )
     }
 
+    fn status(state: State, mode: Option<AccessMode>) -> Status {
+        Status {
+            state,
+            peer: Some("mike".into()),
+            cidr: Some("10.0.0.3/32".into()),
+            listen: Some("10.0.0.10:5900".into()),
+            connections: if state == State::Connected { 1 } else { 0 },
+            mode,
+            expires_in_seconds: None,
+        }
+    }
+
     #[test]
     fn icons_are_well_formed_argb32() {
-        for state in [State::Off, State::Listening, State::Connected] {
-            let icon = render(state);
+        for indicator in ALL {
+            let icon = render(indicator);
             assert_eq!(icon.width, SIZE);
             assert_eq!(icon.height, SIZE);
             assert_eq!(
@@ -123,39 +198,79 @@ mod tests {
     #[test]
     fn every_state_is_a_different_colour() {
         let colours: std::collections::HashSet<u32> =
-            [State::Off, State::Listening, State::Connected]
-                .into_iter()
-                .map(colour_for)
-                .collect();
-        assert_eq!(colours.len(), 3, "states must be visually distinguishable");
+            ALL.into_iter().map(Indicator::colour).collect();
+        assert_eq!(colours.len(), 4, "states must be visually distinguishable");
+    }
+
+    #[test]
+    fn every_state_renders_differently() {
+        // Colour alone is not enough - someone who cannot separate the hues
+        // must still be able to tell these apart.
+        let rendered: Vec<Vec<u8>> = ALL.into_iter().map(|i| render(i).data).collect();
+        for a in 0..rendered.len() {
+            for b in (a + 1)..rendered.len() {
+                assert_ne!(
+                    rendered[a], rendered[b],
+                    "{:?} and {:?} render identically",
+                    ALL[a], ALL[b]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_three_fill_styles_are_distinct_by_shape() {
+        // Compare only the alpha channel, which is what carries shape.
+        let shape =
+            |i: Indicator| -> Vec<u8> { render(i).data.chunks(4).map(|px| px[0]).collect() };
+        assert_eq!(
+            shape(Indicator::Off),
+            shape(Indicator::Waiting),
+            "off and waiting share a shape and differ by colour alone"
+        );
+        assert_ne!(shape(Indicator::Waiting), shape(Indicator::Watching));
+        assert_ne!(shape(Indicator::Watching), shape(Indicator::Controlling));
+        assert_ne!(shape(Indicator::Off), shape(Indicator::Controlling));
+    }
+
+    #[test]
+    fn watching_marks_the_centre_but_does_not_fill_the_screen() {
+        let icon = render(Indicator::Watching);
+        let centre = pixel(&icon, SIZE / 2, (3 + SIZE - 8) / 2);
+        assert_eq!(centre.0, 0xff, "the centre dot should be opaque");
+        // A point inside the screen but away from the dot stays a wash.
+        let off_centre = pixel(&icon, 4, 5);
+        assert!(
+            off_centre.0 > 0 && off_centre.0 < 0xff,
+            "the rest of the screen should stay a wash, got alpha {}",
+            off_centre.0
+        );
+    }
+
+    #[test]
+    fn controlling_fills_the_whole_screen() {
+        let icon = render(Indicator::Controlling);
+        for (x, y) in [(SIZE / 2, (3 + SIZE - 8) / 2), (4, 5), (SIZE - 4, SIZE - 9)] {
+            assert_eq!(
+                pixel(&icon, x, y).0,
+                0xff,
+                "({x},{y}) should be solid when someone has control"
+            );
+        }
     }
 
     #[test]
     fn state_colour_reaches_the_pixels() {
-        let icon = render(State::Connected);
-        // A point on the top border of the screen outline.
+        let icon = render(Indicator::Controlling);
         let (a, r, g, b) = pixel(&icon, SIZE / 2, 4);
         assert_eq!(a, 0xff, "the outline must be fully opaque");
         assert_eq!((r, g, b), (0xe5, 0x39, 0x35));
     }
 
     #[test]
-    fn connected_is_filled_and_listening_is_not() {
-        let centre = (SIZE / 2, 8);
-        let listening = pixel(&render(State::Listening), centre.0, centre.1);
-        let connected = pixel(&render(State::Connected), centre.0, centre.1);
-        assert_eq!(connected.0, 0xff, "connected should be solid");
-        assert!(
-            listening.0 > 0 && listening.0 < 0xff,
-            "listening should be a wash, got alpha {}",
-            listening.0
-        );
-    }
-
-    #[test]
     fn corners_are_transparent() {
-        for state in [State::Off, State::Listening, State::Connected] {
-            let icon = render(state);
+        for indicator in ALL {
+            let icon = render(indicator);
             assert_eq!(pixel(&icon, 0, 0).0, 0, "top-left must be transparent");
             assert_eq!(
                 pixel(&icon, SIZE - 1, SIZE - 1).0,
@@ -163,5 +278,40 @@ mod tests {
                 "bottom-right must be transparent"
             );
         }
+    }
+
+    #[test]
+    fn the_indicator_follows_the_daemon_state() {
+        assert_eq!(Indicator::from_status(&Status::off()), Indicator::Off);
+        assert_eq!(
+            Indicator::from_status(&status(State::Listening, Some(AccessMode::Control))),
+            Indicator::Waiting
+        );
+        assert_eq!(
+            Indicator::from_status(&status(State::Connected, Some(AccessMode::ViewOnly))),
+            Indicator::Watching
+        );
+        assert_eq!(
+            Indicator::from_status(&status(State::Connected, Some(AccessMode::Control))),
+            Indicator::Controlling
+        );
+    }
+
+    #[test]
+    fn an_unknown_mode_is_treated_as_control() {
+        // Fail towards the louder indication: if we cannot tell, assume the
+        // peer can type rather than quietly implying they cannot.
+        assert_eq!(
+            Indicator::from_status(&status(State::Connected, None)),
+            Indicator::Controlling
+        );
+    }
+
+    #[test]
+    fn both_connected_states_count_as_connected() {
+        assert!(Indicator::Watching.is_connected());
+        assert!(Indicator::Controlling.is_connected());
+        assert!(!Indicator::Off.is_connected());
+        assert!(!Indicator::Waiting.is_connected());
     }
 }

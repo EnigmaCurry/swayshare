@@ -11,9 +11,9 @@
 
 use crate::config::{self, Config, Peer};
 use crate::daemon::Daemon;
-use crate::icon;
+use crate::icon::{self, Indicator};
 use crate::invite;
-use crate::ipc::{self, Request, Response, Session, State, Status};
+use crate::ipc::{self, AccessMode, Request, Response, Session, State, Status};
 use crate::paths;
 use anyhow::{Context, Result, bail};
 use ksni::menu::{StandardItem, SubMenu};
@@ -32,7 +32,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Work requested by a menu click, handled off the ksni callback thread.
 #[derive(Debug)]
 enum Command {
-    Start(String),
+    Start(String, AccessMode),
     Stop,
     CopyInvitation,
     OpenConfig,
@@ -61,6 +61,64 @@ impl SwayshareTray {
         self.status.state != State::Off
     }
 
+    fn indicator(&self) -> Indicator {
+        Indicator::from_status(&self.status)
+    }
+
+    /// One submenu of peers for a given access mode.
+    fn peer_submenu(&self, mode: AccessMode) -> MenuItem<Self> {
+        let label = match mode {
+            AccessMode::Control => "Hand the controls to",
+            AccessMode::ViewOnly => "Grant view-only access to",
+        };
+        let active = self.status.peer.clone();
+        let active_mode = self.status.mode;
+
+        let mut entries: Vec<MenuItem<Self>> = Vec::new();
+        if self.peers.is_empty() {
+            entries.push(
+                StandardItem {
+                    label: "No peers configured".into(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        for peer in &self.peers {
+            let name = peer.name.clone();
+            // "Already active" only counts when the mode matches too, so
+            // switching a live session from control to view-only stays
+            // available - it just restarts the session, like any other grant.
+            let is_active = active.as_deref() == Some(name.as_str()) && active_mode == Some(mode);
+            let too_broad = config::requires_force(&peer.cidr);
+            let text = if is_active {
+                format!("{} ({}) - active", peer.name, peer.cidr)
+            } else if too_broad {
+                format!("{} ({}) - too broad", peer.name, peer.cidr)
+            } else {
+                format!("{} ({})", peer.name, peer.cidr)
+            };
+            entries.push(
+                StandardItem {
+                    label: text,
+                    enabled: !is_active && !too_broad,
+                    activate: Box::new(move |tray: &mut Self| {
+                        tray.send(Command::Start(name.clone(), mode))
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        SubMenu {
+            label: label.into(),
+            submenu: entries,
+            ..Default::default()
+        }
+        .into()
+    }
+
     /// One-line summary used for both the menu header and the tooltip.
     fn summary(&self) -> String {
         match self.status.state {
@@ -69,10 +127,13 @@ impl SwayshareTray {
                 Some(peer) => format!("Waiting for {peer} to connect"),
                 None => "Waiting for a connection".to_string(),
             },
-            State::Connected => match &self.status.peer {
-                Some(peer) => format!("{peer} has the controls"),
-                None => "Someone has the controls".to_string(),
-            },
+            State::Connected => {
+                let who = self.status.peer.as_deref().unwrap_or("Someone");
+                match self.status.mode {
+                    Some(AccessMode::ViewOnly) => format!("{who} is watching"),
+                    _ => format!("{who} has the controls"),
+                }
+            }
         }
     }
 
@@ -105,19 +166,23 @@ impl ksni::Tray for SwayshareTray {
     /// `Passive` invites hosts to hide the icon, which is fine when nothing is
     /// shared and unacceptable when something is.
     fn status(&self) -> ksni::Status {
-        match self.status.state {
-            State::Off => ksni::Status::Active,
-            State::Listening => ksni::Status::Active,
-            State::Connected => ksni::Status::NeedsAttention,
+        // Someone being on the desktop demands attention whether or not they
+        // can type: a view-only peer still sees everything on screen.
+        if self.indicator().is_connected() {
+            ksni::Status::NeedsAttention
+        } else {
+            ksni::Status::Active
         }
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        vec![icon::render(self.status.state)]
+        vec![icon::render(self.indicator())]
     }
 
     fn attention_icon_pixmap(&self) -> Vec<ksni::Icon> {
-        vec![icon::render(State::Connected)]
+        // Hosts swap to this one in the NeedsAttention state, so it has to be
+        // the same glyph or the icon would change meaning when it is shown.
+        vec![icon::render(self.indicator())]
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
@@ -133,7 +198,7 @@ impl ksni::Tray for SwayshareTray {
         }
         ksni::ToolTip {
             icon_name: String::new(),
-            icon_pixmap: vec![icon::render(self.status.state)],
+            icon_pixmap: vec![icon::render(self.indicator())],
             title: format!("swayshare - {}", self.summary()),
             description,
         }
@@ -195,51 +260,14 @@ impl ksni::Tray for SwayshareTray {
         }
         items.push(MenuItem::Separator);
 
-        // Peers live in a submenu so that enabling access is never a single
-        // stray click on the top-level menu.
-        let active = self.status.peer.clone();
-        let mut peer_items: Vec<MenuItem<Self>> = Vec::new();
-        if self.peers.is_empty() {
-            peer_items.push(
-                StandardItem {
-                    label: "No peers configured".into(),
-                    enabled: false,
-                    ..Default::default()
-                }
-                .into(),
-            );
+        // Peers live in submenus so that granting access is never a single
+        // stray click on the top-level menu. There is one submenu per access
+        // mode, because the mode is fixed when the session starts: wayvnc
+        // takes --disable-input only at startup, so offering a mid-session
+        // toggle would mean silently disconnecting the peer.
+        for mode in [AccessMode::Control, AccessMode::ViewOnly] {
+            items.push(self.peer_submenu(mode));
         }
-        for peer in &self.peers {
-            let name = peer.name.clone();
-            let is_active = active.as_deref() == Some(name.as_str());
-            let too_broad = config::requires_force(&peer.cidr);
-            let label = if is_active {
-                format!("{} ({}) - active", peer.name, peer.cidr)
-            } else if too_broad {
-                format!("{} ({}) - too broad", peer.name, peer.cidr)
-            } else {
-                format!("{} ({})", peer.name, peer.cidr)
-            };
-            peer_items.push(
-                StandardItem {
-                    label,
-                    enabled: !is_active && !too_broad,
-                    activate: Box::new(move |tray: &mut Self| {
-                        tray.send(Command::Start(name.clone()))
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-            );
-        }
-        items.push(
-            SubMenu {
-                label: "Enable access for".into(),
-                submenu: peer_items,
-                ..Default::default()
-            }
-            .into(),
-        );
 
         items.push(
             StandardItem {
@@ -408,8 +436,8 @@ async fn serve_commands(
                 }
                 return QuitReason::UserQuit;
             }
-            Command::Start(peer) => {
-                let result = request_session(&socket, &peer).await;
+            Command::Start(peer, mode) => {
+                let result = request_session(&socket, &peer, mode).await;
                 report(&handle, result.map(|_| ())).await;
             }
             Command::Stop => {
@@ -439,10 +467,15 @@ async fn serve_commands(
     QuitReason::ChannelClosed
 }
 
-async fn request_session(socket: &std::path::Path, peer: &str) -> Result<Session> {
+async fn request_session(
+    socket: &std::path::Path,
+    peer: &str,
+    mode: AccessMode,
+) -> Result<Session> {
     let req = Request::Start {
         peer: peer.to_string(),
         minutes: None,
+        mode,
     };
     match ipc::expect_ok(ipc::request(socket, &req).await?)? {
         Response::Session(session) => Ok(session),
@@ -550,14 +583,39 @@ mod tests {
     }
 
     fn active_status(state: State, peer: &str) -> Status {
+        status_with(state, peer, AccessMode::Control)
+    }
+
+    fn status_with(state: State, peer: &str, mode: AccessMode) -> Status {
         Status {
             state,
             peer: Some(peer.to_string()),
             cidr: Some("10.0.0.3/32".into()),
             listen: Some("10.0.0.10:5900".into()),
             connections: if state == State::Connected { 1 } else { 0 },
+            mode: Some(mode),
             expires_in_seconds: Some(1800),
         }
+    }
+
+    /// Find a peer entry inside one named submenu, so the two access-mode
+    /// submenus cannot be confused for each other.
+    fn find_in_submenu(tray: &SwayshareTray, submenu: &str, peer: &str) -> (String, bool) {
+        let prefix = format!("{peer} (");
+        for item in ksni::Tray::menu(tray) {
+            if let MenuItem::SubMenu(sub) = item
+                && sub.label == submenu
+            {
+                for entry in sub.submenu {
+                    if let MenuItem::Standard(s) = entry
+                        && s.label.starts_with(&prefix)
+                    {
+                        return (s.label.clone(), s.enabled);
+                    }
+                }
+            }
+        }
+        panic!("no entry for {peer} in submenu {submenu:?}");
     }
 
     /// Flatten the menu to (label, enabled) pairs, descending into submenus.
@@ -637,6 +695,14 @@ mod tests {
         let tray = tray_with(active_status(State::Connected, "mike"), &[]);
         assert_eq!(tray.summary(), "mike has the controls");
         assert!(find(&labels(&tray), "mike has the controls").is_some());
+
+        // The view-only session reads differently, because the difference
+        // matters more than anything else the tray reports.
+        let watching = tray_with(
+            status_with(State::Connected, "mike", AccessMode::ViewOnly),
+            &[],
+        );
+        assert_eq!(watching.summary(), "mike is watching");
     }
 
     #[test]
@@ -698,6 +764,101 @@ mod tests {
     }
 
     #[test]
+    fn both_access_modes_are_offered_for_every_peer() {
+        let tray = tray_with(Status::off(), &[("mike", "10.0.0.3/32")]);
+        assert!(find_in_submenu(&tray, "Hand the controls to", "mike").1);
+        assert!(find_in_submenu(&tray, "Grant view-only access to", "mike").1);
+    }
+
+    #[test]
+    fn only_the_running_mode_is_marked_active() {
+        // mike has full control; "hand the controls to mike" is a no-op, but
+        // switching him to view-only is still a thing you can ask for.
+        let tray = tray_with(
+            status_with(State::Connected, "mike", AccessMode::Control),
+            &[("mike", "10.0.0.3/32")],
+        );
+        let control = find_in_submenu(&tray, "Hand the controls to", "mike");
+        assert!(control.0.contains("active"), "got: {}", control.0);
+        assert!(!control.1, "re-granting the running mode is a no-op");
+
+        let view = find_in_submenu(&tray, "Grant view-only access to", "mike");
+        assert!(!view.0.contains("active"));
+        assert!(
+            view.1,
+            "switching the live session to view-only stays available"
+        );
+    }
+
+    #[test]
+    fn a_too_broad_peer_is_refused_in_both_submenus() {
+        let tray = tray_with(Status::off(), &[("world", "10.0.0.0/8")]);
+        for submenu in ["Hand the controls to", "Grant view-only access to"] {
+            let entry = find_in_submenu(&tray, submenu, "world");
+            assert!(entry.0.contains("too broad"), "got: {}", entry.0);
+            assert!(
+                !entry.1,
+                "{submenu} should not offer a peer the daemon refuses"
+            );
+        }
+    }
+
+    #[test]
+    fn the_icon_distinguishes_watching_from_controlling() {
+        use ksni::Tray;
+        let watching = tray_with(
+            status_with(State::Connected, "mike", AccessMode::ViewOnly),
+            &[],
+        );
+        let controlling = tray_with(
+            status_with(State::Connected, "mike", AccessMode::Control),
+            &[],
+        );
+        assert_ne!(
+            watching.icon_pixmap()[0].data,
+            controlling.icon_pixmap()[0].data,
+            "you must be able to tell at a glance whether they can type"
+        );
+        // Both still demand attention: a watcher sees everything on screen.
+        assert!(matches!(watching.status(), ksni::Status::NeedsAttention));
+        assert!(matches!(controlling.status(), ksni::Status::NeedsAttention));
+    }
+
+    #[test]
+    fn clicking_a_view_only_entry_requests_view_only() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut tray = SwayshareTray::new(tx);
+        tray.peers = vec![Peer {
+            name: "mike".into(),
+            cidr: "10.0.0.3/32".parse().unwrap(),
+        }];
+
+        for item in ksni::Tray::menu(&tray) {
+            if let MenuItem::SubMenu(sub) = item
+                && sub.label == "Grant view-only access to"
+            {
+                for entry in sub.submenu {
+                    if let MenuItem::Standard(s) = entry
+                        && s.label.starts_with("mike (")
+                    {
+                        (s.activate)(&mut tray);
+                    }
+                }
+            }
+        }
+        match rx
+            .try_recv()
+            .expect("the click should have queued a command")
+        {
+            Command::Start(peer, mode) => {
+                assert_eq!(peer, "mike");
+                assert_eq!(mode, AccessMode::ViewOnly);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn menu_clicks_are_queued_rather_than_blocking() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut tray = SwayshareTray::new(tx);
@@ -726,7 +887,10 @@ mod tests {
             .try_recv()
             .expect("the click should have queued a command")
         {
-            Command::Start(peer) => assert_eq!(peer, "mike"),
+            Command::Start(peer, mode) => {
+                assert_eq!(peer, "mike");
+                assert_eq!(mode, AccessMode::Control);
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }

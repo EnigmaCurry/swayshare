@@ -5,6 +5,7 @@
 //! holds the session password and lives at mode 0600 beside the socket.
 
 use crate::identity::Identity;
+use crate::ipc::AccessMode;
 use crate::paths;
 use crate::secret::Secret;
 use anyhow::{Context, Result, bail};
@@ -48,6 +49,34 @@ pub fn render_config(username: &str, password: &Secret, identity: &Identity) -> 
     )
 }
 
+/// Build wayvnc's argument list.
+///
+/// Separate from the spawn so the one security-relevant decision here - that
+/// `--disable-input` is present for a view-only session and absent otherwise -
+/// can be asserted directly. wayvnc reads this flag only at startup, which is
+/// why the access mode is fixed for the life of a session.
+pub fn command_args(
+    config_file: &Path,
+    control_socket: &Path,
+    vnc_socket: &Path,
+    mode: AccessMode,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--unix-socket".into(),
+        "--config".into(),
+        config_file.into(),
+        "--socket".into(),
+        control_socket.into(),
+        "--log-level=info".into(),
+    ];
+    if mode.is_view_only() {
+        args.push("--disable-input".into());
+    }
+    // The listening address must come last: it is positional.
+    args.push(vnc_socket.into());
+    args
+}
+
 impl Wayvnc {
     /// Start wayvnc and wait until its socket is accepting connections.
     pub async fn spawn(
@@ -55,8 +84,9 @@ impl Wayvnc {
         username: &str,
         password: &Secret,
         identity: &Identity,
+        mode: AccessMode,
     ) -> Result<Self> {
-        Self::spawn_program("wayvnc", runtime_dir, username, password, identity).await
+        Self::spawn_program("wayvnc", runtime_dir, username, password, identity, mode).await
     }
 
     /// Start a specific program as the capture backend.
@@ -69,6 +99,7 @@ impl Wayvnc {
         username: &str,
         password: &Secret,
         identity: &Identity,
+        mode: AccessMode,
     ) -> Result<Self> {
         let vnc_socket = runtime_dir.join("vnc.sock");
         let control_socket = runtime_dir.join("wayvnc.sock");
@@ -84,7 +115,14 @@ impl Wayvnc {
 
         // From here on, every error path must erase the config file again:
         // it holds the session password in plaintext.
-        let result = Self::launch(program, config_file.clone(), vnc_socket, control_socket).await;
+        let result = Self::launch(
+            program,
+            config_file.clone(),
+            vnc_socket,
+            control_socket,
+            mode,
+        )
+        .await;
         if result.is_err() {
             paths::remove_if_present(&config_file);
         }
@@ -98,20 +136,20 @@ impl Wayvnc {
         config_file: PathBuf,
         vnc_socket: PathBuf,
         control_socket: PathBuf,
+        mode: AccessMode,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
-        cmd.arg("--unix-socket")
-            .arg("--config")
-            .arg(&config_file)
-            .arg("--socket")
-            .arg(&control_socket)
-            .arg("--log-level=info")
-            .arg(&vnc_socket)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            // If the daemon dies unexpectedly, wayvnc must not outlive it.
-            .kill_on_drop(true);
+        cmd.args(command_args(
+            &config_file,
+            &control_socket,
+            &vnc_socket,
+            mode,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        // If the daemon dies unexpectedly, wayvnc must not outlive it.
+        .kill_on_drop(true);
 
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -218,6 +256,55 @@ mod tests {
         assert!(text.contains("private_key_file=/run/user/1000/swayshare/key.pem"));
     }
 
+    fn args_for(mode: AccessMode) -> Vec<String> {
+        command_args(
+            Path::new("/run/u/swayshare/wayvnc.conf"),
+            Path::new("/run/u/swayshare/wayvnc.sock"),
+            Path::new("/run/u/swayshare/vnc.sock"),
+            mode,
+        )
+        .into_iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+    }
+
+    #[test]
+    fn view_only_disables_input_and_control_does_not() {
+        let view = args_for(AccessMode::ViewOnly);
+        assert!(
+            view.contains(&"--disable-input".to_string()),
+            "a view-only session must start wayvnc with --disable-input: {view:?}"
+        );
+        let control = args_for(AccessMode::Control);
+        assert!(
+            !control.contains(&"--disable-input".to_string()),
+            "a control session must not disable input: {control:?}"
+        );
+    }
+
+    #[test]
+    fn the_socket_path_stays_positional_and_last() {
+        // wayvnc takes the listen address positionally; a flag inserted after
+        // it would be read as the address instead.
+        for mode in [AccessMode::Control, AccessMode::ViewOnly] {
+            let args = args_for(mode);
+            assert_eq!(
+                args.last().map(String::as_str),
+                Some("/run/u/swayshare/vnc.sock"),
+                "the socket path must be the final argument for {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_modes_still_use_a_unix_socket_and_our_config() {
+        for mode in [AccessMode::Control, AccessMode::ViewOnly] {
+            let args = args_for(mode);
+            assert!(args.contains(&"--unix-socket".to_string()));
+            assert!(args.contains(&"/run/u/swayshare/wayvnc.conf".to_string()));
+        }
+    }
+
     #[tokio::test]
     async fn a_failed_launch_leaves_no_password_on_disk() {
         let dir = std::env::temp_dir().join(format!("swayshare-spawn-{}", std::process::id()));
@@ -231,6 +318,7 @@ mod tests {
             "support",
             &pw,
             &test_identity(),
+            AccessMode::Control,
         )
         .await
         .expect_err("a missing backend must not report success");

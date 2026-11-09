@@ -6,7 +6,7 @@
 use crate::config::{self, Config};
 use crate::daemon::{self, Daemon};
 use crate::invite;
-use crate::ipc::{self, Request, Response};
+use crate::ipc::{self, AccessMode, Request, Response};
 use crate::paths;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -49,6 +49,12 @@ enum Command {
     /// Hand the controls to one peer
     Start {
         name: String,
+        /// Let them watch without being able to type or click
+        ///
+        /// Fixed for the session: wayvnc accepts this only at startup, so it
+        /// cannot be changed later without disconnecting them.
+        #[arg(long)]
+        view_only: bool,
         /// Minutes before access is revoked automatically
         #[arg(long, value_name = "MINUTES")]
         minutes: Option<u64>,
@@ -98,6 +104,7 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::List => list_peers(),
         Command::Start {
             name,
+            view_only,
             minutes,
             no_expire,
             no_spawn,
@@ -105,7 +112,12 @@ async fn dispatch(command: Command) -> Result<()> {
             // `Some(0)` is the wire encoding for "no expiry"; `None` means
             // "use the configured default".
             let minutes = if no_expire { Some(0) } else { minutes };
-            start(&name, minutes, no_spawn).await
+            let mode = if view_only {
+                AccessMode::ViewOnly
+            } else {
+                AccessMode::Control
+            };
+            start(&name, minutes, mode, no_spawn).await
         }
         Command::Stop => simple(Request::Stop, "Access revoked.").await,
         Command::Status { json } => status(json).await,
@@ -179,7 +191,7 @@ fn list_peers() -> Result<()> {
     Ok(())
 }
 
-async fn start(name: &str, minutes: Option<u64>, no_spawn: bool) -> Result<()> {
+async fn start(name: &str, minutes: Option<u64>, mode: AccessMode, no_spawn: bool) -> Result<()> {
     let socket = paths::control_socket()?;
     if !daemon_is_running(&socket).await {
         if no_spawn {
@@ -191,6 +203,7 @@ async fn start(name: &str, minutes: Option<u64>, no_spawn: bool) -> Result<()> {
     let req = Request::Start {
         peer: name.to_string(),
         minutes,
+        mode,
     };
     match ipc::expect_ok(ipc::request(&socket, &req).await?)? {
         Response::Session(session) => {
@@ -302,6 +315,19 @@ mod tests {
             Command::Start { name, minutes, .. } => {
                 assert_eq!(name, "mike");
                 assert_eq!(minutes, Some(30));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["swayshare", "start", "mike", "--view-only"]).unwrap();
+        match cli.command {
+            Command::Start { view_only, .. } => assert!(view_only),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["swayshare", "start", "mike"]).unwrap();
+        match cli.command {
+            Command::Start { view_only, .. } => {
+                assert!(!view_only, "full control is the default")
             }
             other => panic!("unexpected: {other:?}"),
         }

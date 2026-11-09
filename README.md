@@ -10,6 +10,10 @@ and under their control, at the same time as you. You both drive. That is the
 point — it is how someone talks you through a problem by just doing it — and
 it is also why the access controls here are as strict as they are.
 
+There is also a **view-only** mode, for when someone needs to look but not
+touch. It is chosen when you grant access, and fixed for that session; see
+[why](#why-view-only-is-fixed-per-session).
+
 [wayvnc](https://github.com/any1/wayvnc) carries the desktop. swayshare
 decides *who* may reach it, *when*, and for *how long*, and it needs no root
 privileges and no firewall changes to do that.
@@ -111,6 +115,9 @@ swayshare list
 # Hand Mike the controls for 30 minutes, and print an invitation to send him.
 swayshare start mike --minutes 30
 
+# ...or let him watch without being able to type or click.
+swayshare start mike --minutes 30 --view-only
+
 # Check on it, or take them back the moment you are done.
 swayshare status
 swayshare stop
@@ -140,15 +147,25 @@ Access expires automatically in 30m.
 swayshare tray
 ```
 
-The tray shows a monitor glyph: grey when nobody has access, amber once a peer
-is authorised but has not connected, and red and filled while someone is
-actually at the controls. That last state is the one that matters — it is your
-standing indication that another person is driving — so the item is reported
-to the bar as needing attention and will not be quietly hidden.
+The tray shows a monitor glyph in one of four states:
 
-Its menu hands the controls to a peer, copies the invitation, revokes access,
-and opens the configuration window. Quitting the tray revokes access and stops
-the daemon.
+| Glyph | Meaning |
+|---|---|
+| grey, empty | nobody has access |
+| amber, empty | a peer is authorised but has not connected |
+| blue, with a dot | connected, **view only** — they can see but not type |
+| red, filled | connected with **full control** |
+
+The states differ in shape as well as colour, so the two distinctions that
+matter — whether anyone is connected, and whether they can type — survive not
+being able to tell blue from red. Both connected states are reported to the
+bar as needing attention and will not be quietly hidden: a view-only peer
+still sees everything on your screen.
+
+Its menu has one submenu per access mode — *Hand the controls to* and *Grant
+view-only access to* — and entries to copy the invitation, revoke access, and
+open the configuration window. Quitting the tray revokes access and stops the
+daemon.
 
 It hosts a daemon itself when none is running, and attaches to one if there
 is. Because the icon is drawn in code rather than looked up in an icon theme,
@@ -167,8 +184,9 @@ exec swayshare tray
 swayshare gui
 ```
 
-Add and remove peers, pick how long access should last, hand the controls to
-the selected peer, and copy the invitation. It talks to the same daemon as
+Add and remove peers, pick how long access should last, choose whether the
+session is view-only, hand the controls to the selected peer, and copy the
+invitation. It talks to the same daemon as
 everything else, so a session started from the tray or the CLI shows up here
 too, invitation included. Closing the window leaves the tray and any running
 session alone.
@@ -195,6 +213,27 @@ While someone else is driving, your own Sway bindings still reach Sway — their
 input and yours are merged into the same seat. If you want to stop your
 modifier key being swallowed by the remote application, wayvnc's man page
 suggests an almost-empty passthrough mode; see its FAQ.
+
+### Why view-only is fixed per session
+
+Because wayvnc only accepts `--disable-input` at startup. Its control socket
+(`wayvncctl`) has no command to change input handling on a running server, so
+switching mid-session would mean restarting wayvnc and dropping the peer's
+connection.
+
+Two other routes were tried and rejected:
+
+- `swaymsg input <device> events disabled` on wayvnc's virtual devices. They
+  *do* appear while a client is connected, and sway returns `success: true` —
+  but the keys still arrive. `events disabled` maps to a libinput call, and
+  virtual devices have no libinput backing. It looks like it works, which
+  makes it worse than not working.
+- `wayvncctl detach`. It terminates the session rather than pausing it.
+
+A toggle that silently disconnects the other person would be a poor control,
+so the choice is made when access is granted instead. If you need to stop
+someone *now*, `swayshare stop` is instant and unambiguous — that is the
+emergency brake, and a mode switch is not.
 
 ## Configuration
 
@@ -260,7 +299,12 @@ What swayshare guarantees:
   security type is never offered; `scripts/e2e-smoke.sh` asserts this against
   a real wayvnc.
 - **You can always see when someone is driving.** The tray icon changes and a
-  desktop notification fires on every connect and disconnect.
+  desktop notification fires on every connect and disconnect, and both say
+  whether the peer can type or only watch.
+- **View-only is enforced by wayvnc, not by politeness.** The session is
+  started with `--disable-input`, so the input path does not exist for the
+  duration; `scripts/e2e-smoke.sh` proves a real authenticated client's key
+  press reaches Sway in a control session and does not in a view-only one.
 - **No privileges.** No root, no setuid, no firewall mutation. Access control
   is entirely in userspace, which is also why it is portable across distros.
 - **One set of rules.** The tray and the window are clients of the same
@@ -269,11 +313,14 @@ What swayshare guarantees:
 
 What it does **not** do:
 
-- **It does not limit what the other person can do.** Once connected they have
-  the same keyboard and pointer you do. There is no view-only mode, no prompt
-  before each action, and no audit log of what they did. The only controls are
-  *who*, *when*, and *for how long* — so invite people you would hand an
-  unlocked laptop to, and nobody else.
+- **In a full-control session it does not limit what the other person can
+  do.** They have the same keyboard and pointer you do. There is no prompt
+  before each action and no audit log of what they did. Apart from choosing
+  view-only, the only controls are *who*, *when*, and *for how long* — so
+  invite people you would hand an unlocked laptop to, and nobody else.
+- **View-only still shows them everything.** Input is dropped, but every
+  window, password manager and private message on screen is visible. It is a
+  limit on what they can *do*, not on what they can *see*.
 - It does not manage your VPN. Peers must already be reachable through it.
 - It does not defend against a peer whose address has been taken over by
   someone else. Source-address filtering is only as strong as the tunnel
@@ -290,15 +337,22 @@ nix develop -c ./scripts/tray-smoke.sh  # the tray, over a private D-Bus session
 nix develop -c ./scripts/gui-smoke.sh   # the window, under a headless Sway
 ```
 
-- `e2e-smoke.sh` runs a real wayvnc on a headless Sway and checks that a VNC
-  stream really traverses the gate, that authentication is enforced (wayvnc
-  must not offer the "None" security type), that an unauthorised source
-  receives no bytes at all, that stop revokes immediately, and that no
+- `e2e-smoke.sh` runs a real wayvnc on a headless Sway and drives it with
+  `scripts/vnc_client.py`, a minimal VeNCrypt client written for these tests
+  because no command-line viewer will take a VeNCrypt password
+  non-interactively. It completes a genuine X509Plain + TLS 1.3 handshake,
+  verifies the server certificate against swayshare's own stored cert, and
+  authenticates with the generated password. The script then checks that a
+  wrong password is refused, that an unauthorised source address receives no
+  bytes at all, that a full-control session's key press reaches Sway while a
+  view-only session's does not, that stop revokes immediately, and that no
   credentials are left behind.
 - `tray-smoke.sh` runs the tray on a bus created by `dbus-run-session`, so it
   never touches your real tray, and asserts over D-Bus that the item
-  registers, that its icon and `Status` track the session, that the menu
-  reflects the state, and that quitting revokes access and stops the daemon.
+  registers, that its icon and `Status` track the session, that a connected
+  view-only session renders a different icon from a connected full-control
+  one, that the menu reflects the state, and that quitting revokes access and
+  stops the daemon.
 - `gui-smoke.sh` opens the window on a headless Sway and checks that it maps,
   renders, and follows the daemon's state. Note that a headless wlroots seat
   has no input devices, so synthetic clicking is not possible there: the logic
@@ -315,8 +369,6 @@ nix develop -c ./scripts/gui-smoke.sh   # the window, under a headless Sway
 
 Possible next steps:
 
-- A view-only mode, using wayvnc's `--disable-input`, for the cases where
-  someone needs to look but not touch.
 - Subscribe to daemon events over the control socket instead of polling once a
   second, so the tray and window react instantly.
 - Use wayvnc's own control socket (`wayvncctl`) to expose per-client detail.
@@ -324,6 +376,8 @@ Possible next steps:
   remains the only source of connection identity.
 - Let the window edit `network.interface` / `port`, which today still means
   editing the config file.
+- A mid-session view-only switch, if wayvnc ever grows a control-socket
+  command for it. Doing it today would mean disconnecting the peer.
 
 Deliberately out of scope: managing the WireGuard tunnel itself.
 
