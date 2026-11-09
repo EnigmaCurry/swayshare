@@ -125,7 +125,7 @@ LAYOUT_OFF=$(menu_layout)
 if [ -z "$LAYOUT_OFF" ]; then
   fail "the dbusmenu layout could not be read"
 else
-  echo "$LAYOUT_OFF" | grep -q "Sharing off" && pass "menu header says 'Sharing off'" \
+  echo "$LAYOUT_OFF" | grep -q "Remote access off" && pass "menu header says 'Remote access off'" \
     || fail "menu header missing"
   echo "$LAYOUT_OFF" | grep -q "Enable access for" && pass "peer submenu present" \
     || fail "peer submenu missing"
@@ -146,7 +146,7 @@ if [ -n "$LIVE" ]; then
     || fail "icon did not change when sharing started"
 
   LAYOUT_ON=$(menu_layout)
-  echo "$LAYOUT_ON" | grep -q "Waiting for tester" \
+  echo "$LAYOUT_ON" | grep -q "Waiting for tester to connect" \
     && pass "menu header tracks the session" || fail "menu header did not update"
 
   echo "== connect, and the item should demand attention =="
@@ -166,8 +166,8 @@ PY
   ICON_CONN=$(icon_digest)
   [ "$ICON_CONN" != "$ICON_ON" ] && pass "icon changed again on connect ($ICON_CONN)" \
     || fail "icon did not change on connect"
-  echo "$(menu_layout)" | grep -q "is viewing your screen" \
-    && pass "menu says someone is viewing" || fail "menu did not report the viewer"
+  echo "$(menu_layout)" | grep -q "has the controls" \
+    && pass "menu says who has the controls" || fail "menu did not report the connected peer"
   wait $VIEWER 2>/dev/null
 
   echo "== stop =="

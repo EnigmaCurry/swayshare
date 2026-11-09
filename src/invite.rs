@@ -10,15 +10,21 @@ pub fn render(session: &Session) -> String {
     let mut out = String::new();
     out.push_str("Remote support invitation\n");
     out.push_str("-------------------------\n");
-    out.push_str("Viewer:   TigerVNC (or any VeNCrypt-capable client)\n");
+    out.push_str("Client:   TigerVNC (or any VeNCrypt-capable client)\n");
     out.push_str(&format!("Address:  {}:{}\n", session.address, session.port));
     out.push_str(&format!("Username: {}\n", session.username));
     out.push_str(&format!("Password: {}\n", session.password));
     out.push_str(&format!("TLS cert: SHA256:{}\n", session.fingerprint));
     out.push('\n');
-    out.push_str("Connect through the VPN tunnel. The password is valid for this\n");
-    out.push_str("session only, and only connections from your own address are\n");
-    out.push_str(&format!("accepted ({}).\n", session.cidr));
+    // Say plainly what the recipient is being handed: they will be driving a
+    // live desktop, not watching a stream of one.
+    out.push_str("You will have full control of the screen, keyboard and pointer,\n");
+    out.push_str("at the same time as me. Connect through the VPN tunnel. The\n");
+    out.push_str("password is valid for this session only, and only connections\n");
+    out.push_str(&format!(
+        "from your own address are accepted ({}).\n",
+        session.cidr
+    ));
     if let Some(secs) = session.expires_in_seconds {
         out.push_str(&format!(
             "Access expires automatically in {}.\n",

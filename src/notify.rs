@@ -20,23 +20,25 @@ fn send(summary: String, body: String, critical: bool) {
 
 pub fn session_started(peer: &str, listen: &str) {
     send(
-        "Screen sharing enabled".into(),
-        format!("Waiting for {peer} to connect on {listen}."),
+        "Remote access enabled".into(),
+        format!("Waiting for {peer} to take the controls on {listen}."),
         false,
     );
 }
 
 pub fn client_connected(peer: &str, ip: &str) {
+    // The one notification that must not be missed: from here on, someone
+    // else's keystrokes land in this session.
     send(
-        "Someone is viewing your screen".into(),
-        format!("{peer} connected from {ip}."),
+        "Someone is controlling your desktop".into(),
+        format!("{peer} connected from {ip} and now has keyboard and pointer control."),
         true,
     );
 }
 
 pub fn client_disconnected(peer: &str) {
     send(
-        "Viewer disconnected".into(),
+        "You have the controls back".into(),
         format!("{peer} has disconnected."),
         false,
     );
@@ -52,8 +54,8 @@ pub fn rejected(ip: &str, reason: &str) {
 
 pub fn session_stopped(reason: &str) {
     send(
-        "Screen sharing disabled".into(),
-        format!("Sharing stopped: {reason}."),
+        "Remote access revoked".into(),
+        format!("Access ended: {reason}."),
         false,
     );
 }

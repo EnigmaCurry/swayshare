@@ -22,7 +22,7 @@ pub enum Request {
     Stop,
     /// Re-print the invitation for the running session.
     Invite,
-    /// Stop sharing and exit the daemon.
+    /// Revoke access and exit the daemon.
     Shutdown,
 }
 
@@ -40,9 +40,9 @@ pub enum Response {
 pub enum State {
     /// No listener bound. The only state the daemon starts in.
     Off,
-    /// Gate bound, one peer authorised, nobody connected.
+    /// Gate bound, one peer authorised, nobody connected yet.
     Listening,
-    /// A remote viewer is attached.
+    /// A remote peer is connected and has keyboard and pointer control.
     Connected,
 }
 

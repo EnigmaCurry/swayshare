@@ -64,14 +64,14 @@ impl SwayshareTray {
     /// One-line summary used for both the menu header and the tooltip.
     fn summary(&self) -> String {
         match self.status.state {
-            State::Off => "Sharing off".to_string(),
+            State::Off => "Remote access off".to_string(),
             State::Listening => match &self.status.peer {
-                Some(peer) => format!("Waiting for {peer}"),
+                Some(peer) => format!("Waiting for {peer} to connect"),
                 None => "Waiting for a connection".to_string(),
             },
             State::Connected => match &self.status.peer {
-                Some(peer) => format!("{peer} is viewing your screen"),
-                None => "Someone is viewing your screen".to_string(),
+                Some(peer) => format!("{peer} has the controls"),
+                None => "Someone has the controls".to_string(),
             },
         }
     }
@@ -252,7 +252,7 @@ impl ksni::Tray for SwayshareTray {
         );
         items.push(
             StandardItem {
-                label: "Stop sharing".into(),
+                label: "Revoke access".into(),
                 enabled: self.sharing(),
                 activate: Box::new(|tray: &mut Self| tray.send(Command::Stop)),
                 ..Default::default()
@@ -599,10 +599,10 @@ mod tests {
     fn off_state_offers_no_stop_or_invitation() {
         let tray = tray_with(Status::off(), &[("mike", "10.0.0.3/32")]);
         let items = labels(&tray);
-        assert!(!find(&items, "Sharing off").unwrap().1);
+        assert!(!find(&items, "Remote access off").unwrap().1);
         assert!(
-            !find(&items, "Stop sharing").unwrap().1,
-            "stop must be disabled when nothing is shared"
+            !find(&items, "Revoke access").unwrap().1,
+            "revoking must be disabled when nobody has access"
         );
         assert!(!find(&items, "Copy invitation").unwrap().1);
         assert!(find_peer(&items, "mike").1, "mike should be startable");
@@ -615,8 +615,8 @@ mod tests {
             &[("mike", "10.0.0.3/32"), ("jane", "10.0.0.4/32")],
         );
         let items = labels(&tray);
-        assert!(find(&items, "Waiting for mike").is_some());
-        assert!(find(&items, "Stop sharing").unwrap().1);
+        assert!(find(&items, "Waiting for mike to connect").is_some());
+        assert!(find(&items, "Revoke access").unwrap().1);
         assert!(find(&items, "Copy invitation").unwrap().1);
 
         let mike = find_peer(&items, "mike");
@@ -633,10 +633,10 @@ mod tests {
     }
 
     #[test]
-    fn connected_state_says_who_is_watching() {
+    fn connected_state_says_who_is_driving() {
         let tray = tray_with(active_status(State::Connected, "mike"), &[]);
-        assert_eq!(tray.summary(), "mike is viewing your screen");
-        assert!(find(&labels(&tray), "mike is viewing your screen").is_some());
+        assert_eq!(tray.summary(), "mike has the controls");
+        assert!(find(&labels(&tray), "mike has the controls").is_some());
     }
 
     #[test]

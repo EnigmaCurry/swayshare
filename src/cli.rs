@@ -17,9 +17,10 @@ use std::time::Duration;
 #[command(
     name = "swayshare",
     about = "Temporary, peer-scoped remote desktop access for Sway",
-    long_about = "swayshare grants one named peer temporary access to your Sway \
-                  desktop. wayvnc does the screen sharing on a private Unix socket; \
-                  swayshare decides who may reach it.",
+    long_about = "swayshare hands one named peer temporary control of your Sway \
+                  desktop - screen, keyboard and pointer, at the same time as you. \
+                  wayvnc carries the desktop over a private Unix socket; swayshare \
+                  decides who may reach it, when, and for how long.",
     version
 )]
 pub struct Cli {
@@ -29,7 +30,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Add a peer that may be granted access later
+    /// Add a peer you would be willing to hand the controls to
     Add {
         /// Short name, e.g. "mike"
         name: String,
@@ -45,7 +46,7 @@ enum Command {
     /// List configured peers
     #[command(visible_alias = "peers")]
     List,
-    /// Enable access for one peer
+    /// Hand the controls to one peer
     Start {
         name: String,
         /// Minutes before access is revoked automatically
@@ -58,9 +59,9 @@ enum Command {
         #[arg(long)]
         no_spawn: bool,
     },
-    /// Revoke access immediately
+    /// Take the controls back immediately
     Stop,
-    /// Show the current sharing state
+    /// Show who currently has access
     Status {
         /// Emit JSON instead of text
         #[arg(long)]
@@ -74,7 +75,7 @@ enum Command {
     Tray,
     /// Open the configuration window
     Gui,
-    /// Stop sharing and exit the running daemon
+    /// Revoke access and exit the running daemon
     Quit,
     /// Print the config file path
     #[command(name = "config-path")]
@@ -106,7 +107,7 @@ async fn dispatch(command: Command) -> Result<()> {
             let minutes = if no_expire { Some(0) } else { minutes };
             start(&name, minutes, no_spawn).await
         }
-        Command::Stop => simple(Request::Stop, "Sharing stopped.").await,
+        Command::Stop => simple(Request::Stop, "Access revoked.").await,
         Command::Status { json } => status(json).await,
         Command::Invite => show_invite().await,
         Command::Daemon => Daemon::run().await,

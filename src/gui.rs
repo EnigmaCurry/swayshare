@@ -114,7 +114,7 @@ fn build_window(app: &gtk::Application) {
             .build(),
         minutes: gtk::SpinButton::with_range(0.0, 1440.0, 5.0),
         enable_button: gtk::Button::with_label("Enable access"),
-        stop_button: gtk::Button::with_label("Stop sharing"),
+        stop_button: gtk::Button::with_label("Revoke access"),
         copy_button: gtk::Button::with_label("Copy invitation"),
         add_button: gtk::Button::with_label("Add"),
         remove_button: gtk::Button::with_label("Remove selected peer"),
@@ -568,7 +568,7 @@ fn handle_event(ui: &Rc<Ui>, event: UiEvent) {
         UiEvent::Stopped => {
             *ui.session.borrow_mut() = None;
             ui.invitation.buffer().set_text("");
-            set_message(ui, "Sharing stopped.", false);
+            set_message(ui, "Access revoked.", false);
         }
         UiEvent::Error(message) => set_message(ui, &message, true),
     }
@@ -583,9 +583,9 @@ fn show_invitation(ui: &Rc<Ui>, session: Session) {
 
 fn render_status(ui: &Rc<Ui>, status: &Status) {
     ui.state_label.set_label(match status.state {
-        State::Off => "Sharing off",
-        State::Listening => "Sharing on - waiting for a connection",
-        State::Connected => "Sharing on - someone is connected",
+        State::Off => "Remote access off",
+        State::Listening => "Access granted - waiting for them to connect",
+        State::Connected => "Someone is controlling your desktop",
     });
 
     let mut detail = String::new();

@@ -461,9 +461,9 @@ fn format_error(e: &anyhow::Error) -> String {
 pub fn render_status(status: &Status) -> String {
     let mut out = String::new();
     match status.state {
-        State::Off => out.push_str("Sharing is off\n"),
-        State::Listening => out.push_str("Sharing is on - waiting for a connection\n"),
-        State::Connected => out.push_str("Sharing is on - someone is connected\n"),
+        State::Off => out.push_str("Remote access is off\n"),
+        State::Listening => out.push_str("Access granted - waiting for them to connect\n"),
+        State::Connected => out.push_str("Someone is controlling your desktop\n"),
     }
     if let (Some(peer), Some(cidr)) = (&status.peer, &status.cidr) {
         out.push_str(&format!("  Peer:        {peer} ({cidr})\n"));
