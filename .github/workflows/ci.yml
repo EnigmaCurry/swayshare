@@ -1,4 +1,4 @@
-# Continuous integration for the main branch and pull requests.
+# Continuous integration for the master branch and pull requests.
 #
 # Everything here is a thin wrapper around the Justfile, so what CI runs and
 # what you run locally cannot drift apart: `just check` is the whole gate.
@@ -11,7 +11,7 @@ name: ci
 
 on:
   push:
-    branches: ['main']
+    branches: ['master']
   pull_request:
   workflow_dispatch:
 

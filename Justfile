@@ -9,7 +9,7 @@ PKGBUILD       := ROOT / "packaging/aur/PKGBUILD"
 
 RUST_BACKTRACE := env_var_or_default("RUST_BACKTRACE", "1")
 GIT_REMOTE     := env_var_or_default("GIT_REMOTE", "origin")
-MAIN_BRANCH    := env_var_or_default("MAIN_BRANCH", "main")
+DEFAULT_BRANCH := env_var_or_default("DEFAULT_BRANCH", "master")
 
 # The published artifact is the CLI and tray without GTK, linked statically.
 STATIC_TARGET  := env_var_or_default("STATIC_TARGET", "x86_64-unknown-linux-musl")
@@ -176,7 +176,7 @@ bump-version level="patch":
     # There is deliberately no git-cliff step: this project does not use
     # conventional commits, so the bump is stated rather than derived.
     @if [ -n "$(git status --porcelain)" ]; then echo "## Git status is not clean. Commit your changes before bumping version."; exit 1; fi
-    @if [ "$(git symbolic-ref --short HEAD)" != "{{MAIN_BRANCH}}" ]; then echo "## You may only bump the version from the {{MAIN_BRANCH}} branch."; exit 1; fi
+    @if [ "$(git symbolic-ref --short HEAD)" != "{{DEFAULT_BRANCH}}" ]; then echo "## You may only bump the version from the {{DEFAULT_BRANCH}} branch."; exit 1; fi
     @set -eo pipefail; \
     source {{FUNCS_SCRIPT}}; \
     check_deps cargo-set-version git; \
@@ -208,10 +208,10 @@ bump-version level="patch":
     echo "Created new branch: release-v${VERSION}"; \
     echo "You should push this branch and create a PR for it."
 
-# Tag and release the current version from the main branch
+# Tag and release the current version from the master branch
 release:
     @if [ -n "$(git status --porcelain)" ]; then echo "## Git status is not clean. Commit your changes before releasing."; exit 1; fi
-    @if [ "$(git symbolic-ref --short HEAD)" != "{{MAIN_BRANCH}}" ]; then echo "## You may only release the {{MAIN_BRANCH}} branch."; exit 1; fi
+    @if [ "$(git symbolic-ref --short HEAD)" != "{{DEFAULT_BRANCH}}" ]; then echo "## You may only release the {{DEFAULT_BRANCH}} branch."; exit 1; fi
     git remote update
     @if [[ "$(git status -uno)" != *"Your branch is up to date"* ]]; then echo "## Git branch is not in sync with git remote ${GIT_REMOTE}."; exit 1; fi
     @set -eo pipefail; \

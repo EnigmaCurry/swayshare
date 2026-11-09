@@ -402,7 +402,7 @@ what distribution packaging is for.
 
 - `packaging/aur/PKGBUILD` builds the full package, with a commented block
   showing the two-line change for a `swayshare-cli` variant.
-- `.github/workflows/ci.yml` runs `just check` on the main branch and on
+- `.github/workflows/ci.yml` runs `just check` on the master branch and on
   every pull request, plus the static build and a dependency audit.
 - `.github/workflows/release.yml` runs `just check` and `just package` on a
   tag, asserts the binary really has no dynamic dependencies, and publishes
@@ -457,7 +457,7 @@ and CI before anything is tagged:
 ```sh
 just bump-version          # or: just bump-version minor | major | 1.2.3
                            # makes a release-vX branch; push it and open a PR
-just release               # from main, once merged: audits, tags and pushes
+just release               # from master, once merged: audits, tags and pushes
 ```
 
 `bump-version` keeps `Cargo.toml`, `Cargo.lock` and the AUR `PKGBUILD` in
