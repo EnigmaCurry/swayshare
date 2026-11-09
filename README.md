@@ -249,26 +249,27 @@ input and yours are merged into the same seat. If you want to stop your
 modifier key being swallowed by the remote application, wayvnc's man page
 suggests an almost-empty passthrough mode; see its FAQ.
 
-The mirror of that problem is running Sway *inside* a VNC viewer: when the
-remote desktop is itself a Sway session (for example a nested Sway shown in
-TigerVNC), your `$mod` bindings are caught by the outer compositor and never
-reach the inner one. Put the inner Sway in a passthrough mode that hands every
-key to the guest until you explicitly leave it, and bind the toggle to a key
-that no compositor claims — `$mod+Pause` works well:
+The mirror of that problem is on the *viewing* side: when you run `vncviewer`
+inside your own Sway session and the remote desktop is itself a Sway, your
+local Sway catches every `$mod` binding before it reaches the viewer, so those
+keys never make it through to the remote compositor. Put your **local** Sway
+(the one hosting the `vncviewer` window) into a passthrough mode that forwards
+every key to the focused window until you explicitly leave it, and bind the
+toggle to a key that no compositor claims — `$mod+Pause` works well:
 
 ```
-# In the *inner* Sway config (the one displayed over VNC):
+# In your *local* Sway config (the client hosting the vncviewer window):
 mode passthrough {
     # Leave passthrough: give bindings and the floating modifier back.
     bindsym $mod+Pause mode default; floating_modifier $mod normal
 }
 
-# Enter passthrough: forward $mod to applications, including a nested Sway.
+# Enter passthrough: forward $mod to the focused window, i.e. into vncviewer.
 bindsym $mod+Pause mode passthrough; floating_modifier none
 ```
 
-`floating_modifier none` while in passthrough stops the inner Sway from
-intercepting `$mod`+drag, so those events reach a further-nested client too.
+`floating_modifier none` while in passthrough stops your local Sway from
+intercepting `$mod`+drag, so those events reach the remote Sway too.
 `$mod+Pause` flips the mode back and restores normal `$mod` handling.
 
 ### Why view-only is fixed per session
