@@ -249,6 +249,28 @@ input and yours are merged into the same seat. If you want to stop your
 modifier key being swallowed by the remote application, wayvnc's man page
 suggests an almost-empty passthrough mode; see its FAQ.
 
+The mirror of that problem is running Sway *inside* a VNC viewer: when the
+remote desktop is itself a Sway session (for example a nested Sway shown in
+TigerVNC), your `$mod` bindings are caught by the outer compositor and never
+reach the inner one. Put the inner Sway in a passthrough mode that hands every
+key to the guest until you explicitly leave it, and bind the toggle to a key
+that no compositor claims — `$mod+Pause` works well:
+
+```
+# In the *inner* Sway config (the one displayed over VNC):
+mode passthrough {
+    # Leave passthrough: give bindings and the floating modifier back.
+    bindsym $mod+Pause mode default; floating_modifier $mod normal
+}
+
+# Enter passthrough: forward $mod to applications, including a nested Sway.
+bindsym $mod+Pause mode passthrough; floating_modifier none
+```
+
+`floating_modifier none` while in passthrough stops the inner Sway from
+intercepting `$mod`+drag, so those events reach a further-nested client too.
+`$mod+Pause` flips the mode back and restores normal `$mod` handling.
+
 ### Why view-only is fixed per session
 
 Because wayvnc only accepts `--disable-input` at startup. Its control socket
