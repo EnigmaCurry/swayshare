@@ -1,0 +1,28 @@
+# Installs `just` from crates.io and caches the result.
+#
+# A local composite action rather than a third-party one: this runs in the
+# release path for a tool that grants remote control of a desktop, and the
+# fewer outside actions with access to that pipeline the better. Building from
+# crates.io costs about a minute on a cache miss and nothing afterwards.
+
+name: Install just
+description: Install the just command runner, with caching
+
+runs:
+  using: composite
+  steps:
+    - name: Restore cached just
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/just
+        key: just-${{ runner.os }}-${{ runner.arch }}-v1
+
+    - name: Install just
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: cargo install --locked just
+
+    - name: Verify
+      shell: bash
+      run: just --version

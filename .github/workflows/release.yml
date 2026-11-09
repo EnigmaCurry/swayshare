@@ -1,8 +1,10 @@
 # Release pipeline for swayshare.
 #
-# Deliberately uses only actions/checkout and the preinstalled `gh` CLI. This
-# is the build path for a tool that grants remote control of a desktop, so the
-# fewer third-party actions with access to it, the better.
+# Every step that can be is a call into the Justfile, so a release runs the
+# same commands you can run locally. Only actions/checkout, actions/cache and
+# the preinstalled `gh` CLI are used: this is the build path for a tool that
+# grants remote control of a desktop, so the fewer third-party actions with
+# access to it, the better.
 #
 # What gets published is a statically linked swayshare-cli: the CLI and tray
 # without the GTK window. That build links nothing but libc, so a musl target
@@ -26,7 +28,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  TARGET: x86_64-unknown-linux-musl
 
 jobs:
   verify:
@@ -42,21 +43,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y libgtk-4-dev
 
-      - name: Formatting
-        run: cargo fmt --all --check
+      - uses: ./.github/actions/install-just
 
-      # Both feature sets, because they compile different code: the GTK shell
-      # only exists in one of them, and the window's state machine must build
-      # and pass in both.
-      - name: Clippy (with the GTK window)
-        run: cargo clippy --all-targets --locked -- -D warnings
-      - name: Tests (with the GTK window)
-        run: cargo test --locked
-
-      - name: Clippy (without GTK)
-        run: cargo clippy --all-targets --locked --no-default-features -- -D warnings
-      - name: Tests (without GTK)
-        run: cargo test --locked --no-default-features
+      - run: just check
 
   build:
     name: static binary
@@ -71,34 +60,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y musl-tools
-          rustup target add "$TARGET"
 
-      - name: Build
-        run: cargo build --release --locked --no-default-features --target "$TARGET"
+      - uses: ./.github/actions/install-just
 
-      # The point of this artifact is that it has no runtime dependencies.
-      # Assert it rather than assume it: a dynamically linked binary here would
-      # silently defeat the entire reason for shipping it.
-      - name: Check the binary really is static
-        run: |
-          bin="target/$TARGET/release/swayshare"
-          file "$bin"
-          # Depending on whether rustc emits static-pie, ldd says either
-          # "not a dynamic executable" or "statically linked". Anything else
-          # means we have dynamic dependencies.
-          out=$(ldd "$bin" 2>&1 || true)
-          case "$out" in
-            *"not a dynamic executable"*|*"statically linked"*)
-              echo "no dynamic dependencies: $out" ;;
-            *)
-              echo "::error::$bin has dynamic dependencies:"
-              echo "$out"
-              exit 1 ;;
-          esac
+      # `just package` builds the static binary, asserts it has no dynamic
+      # dependencies, and writes dist/ - the same recipe used locally.
+      - run: just package
 
       - name: Smoke-test the binary
         run: |
-          bin="target/$TARGET/release/swayshare"
+          bin=$(ls dist/swayshare-cli-*/swayshare)
           "$bin" --version
           "$bin" --help > /dev/null
           # The GUI subcommand must refuse cleanly rather than crash.
@@ -108,24 +79,6 @@ jobs:
             echo '::error::the no-GTK build did not refuse gui as expected'
             exit 1
           fi
-
-      - name: Package
-        id: package
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          dispatch_tag="${{ github.event.inputs.tag }}"
-          if [ -n "$dispatch_tag" ]; then
-            version="${dispatch_tag#v}"
-          fi
-          name="swayshare-cli-${version}-x86_64-linux-musl"
-          mkdir -p "dist/$name"
-          cp "target/$TARGET/release/swayshare" "dist/$name/swayshare"
-          strip "dist/$name/swayshare"
-          cp README.md LICENSE "dist/$name/"
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
-          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -152,8 +105,6 @@ jobs:
       # rather than a separate manual step.
       - name: Checksum the source tarball
         id: src
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ github.event.inputs.tag || github.ref_name }}"
           url="${{ github.server_url }}/${{ github.repository }}/archive/refs/tags/${tag}.tar.gz"
@@ -166,6 +117,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ steps.src.outputs.tag }}"
+          version="${tag#v}"
           {
             echo "## Installing"
             echo
@@ -179,8 +131,8 @@ jobs:
             echo 'source or install a distribution package for that.'
             echo
             echo '```sh'
-            echo "tar xzf swayshare-cli-${tag#v}-x86_64-linux-musl.tar.gz"
-            echo "sudo install -m0755 swayshare-cli-${tag#v}-x86_64-linux-musl/swayshare /usr/local/bin/"
+            echo "tar xzf swayshare-cli-${version}-x86_64-linux-musl.tar.gz"
+            echo "sudo install -m0755 swayshare-cli-${version}-x86_64-linux-musl/swayshare /usr/local/bin/"
             echo 'swayshare --help'
             echo '```'
             echo

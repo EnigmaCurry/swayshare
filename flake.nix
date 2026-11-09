@@ -74,6 +74,11 @@
             clippy
             rustfmt
             rust-analyzer
+            # The Justfile is the entry point for everything; CI calls the
+            # same recipes.
+            just
+            cargo-edit
+            cargo-audit
             # Runtime dependencies, plus what the smoke-test scripts need.
             wayvnc
             wl-clipboard

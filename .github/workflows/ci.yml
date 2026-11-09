@@ -1,0 +1,68 @@
+# Continuous integration for the main branch and pull requests.
+#
+# Everything here is a thin wrapper around the Justfile, so what CI runs and
+# what you run locally cannot drift apart: `just check` is the whole gate.
+#
+# Not covered here: the three smoke suites. They need wayvnc 0.10 or newer and
+# a wlroots compositor, and the wayvnc in Ubuntu's archive is too old for the
+# flags swayshare depends on. Run them locally with `nix develop -c just smoke`.
+
+name: ci
+
+on:
+  push:
+    branches: ['main']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GTK development files
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libgtk-4-dev
+
+      - uses: ./.github/actions/install-just
+
+      # Formatting, clippy and tests, in both feature sets. The GTK shell only
+      # exists in one of them, and the window's state machine must build and
+      # pass in both.
+      - run: just check
+
+  static:
+    name: static binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools
+
+      - uses: ./.github/actions/install-just
+
+      # Built on every change rather than only at release time: musl breakage
+      # is the kind of thing that should not first appear while cutting a tag.
+      # The recipe asserts the result has no dynamic dependencies.
+      - run: just build-static
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/install-just
+      - run: cargo install --locked cargo-audit
+      - run: just audit

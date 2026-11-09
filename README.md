@@ -117,11 +117,9 @@ cargo install swayshare --no-default-features  # CLI and tray only
 From source — `wayvnc` 0.10 or newer must be on `PATH`:
 
 ```sh
-nix develop                      # provides GTK, wayvnc, and the test tooling
-cargo build --release
-
-# Without the configuration window, and therefore without needing GTK:
-cargo build --release --no-default-features
+nix develop            # GTK, wayvnc, sway, just and the test tooling
+just build             # with the configuration window
+just build-cli         # without it, and therefore without needing GTK
 ```
 
 ## Quickstart
@@ -404,10 +402,17 @@ what distribution packaging is for.
 
 - `packaging/aur/PKGBUILD` builds the full package, with a commented block
   showing the two-line change for a `swayshare-cli` variant.
-- `.github/workflows/release.yml` runs both feature sets through tests and
-  clippy, builds the static binary, asserts it really has no dynamic
-  dependencies, and publishes it with the source-tarball checksum the AUR
-  package needs.
+- `.github/workflows/ci.yml` runs `just check` on the main branch and on
+  every pull request, plus the static build and a dependency audit.
+- `.github/workflows/release.yml` runs `just check` and `just package` on a
+  tag, asserts the binary really has no dynamic dependencies, and publishes
+  it with the source-tarball checksum the AUR package needs.
+
+Both call the Justfile rather than inlining cargo commands, and both use only
+`actions/checkout`, `actions/cache` and the preinstalled `gh` CLI. `just`
+itself is installed by a local composite action: this is the build path for a
+tool that grants remote control of a desktop, so third-party actions are kept
+out of it.
 
 Whatever route you take, express **wayvnc ≥ 0.10** as a hard dependency.
 swayshare relies on `--unix-socket`, `--disable-input` and the
@@ -430,16 +435,44 @@ Flatpak is a worse fit still. The design deliberately avoids portals — wayvnc
 needs `wlr-screencopy` and the virtual-keyboard and virtual-pointer protocols
 directly — so it would take enough sandbox holes to defeat the point.
 
+## Development
+
+The Justfile is the entry point, and CI calls the same recipes, so what runs
+on a pull request and what you run locally cannot drift apart.
+
+```sh
+just                   # list every recipe
+just check             # fmt, clippy and tests in BOTH feature sets - the CI gate
+just run status        # build and run with arguments
+just daemon            # run the supervisor in the foreground
+just tray              # run the tray applet
+just gui               # open the configuration window
+just smoke             # all three smoke suites (needs nix develop)
+just package           # build the release tarball exactly as CI does
+```
+
+Releasing follows two steps, so the version bump goes through a pull request
+and CI before anything is tagged:
+
+```sh
+just bump-version          # or: just bump-version minor | major | 1.2.3
+                           # makes a release-vX branch; push it and open a PR
+just release               # from main, once merged: audits, tags and pushes
+```
+
+`bump-version` keeps `Cargo.toml`, `Cargo.lock` and the AUR `PKGBUILD` in
+step, and `release` refuses to tag if they have drifted apart.
+
 ## Testing
 
 ```sh
-cargo test                            # unit, gate, and control-protocol tests
-nix develop -c ./scripts/e2e-smoke.sh   # the gate, against a real wayvnc
-nix develop -c ./scripts/tray-smoke.sh  # the tray, over a private D-Bus session
-nix develop -c ./scripts/gui-smoke.sh   # the window, under a headless Sway
+just test              # with the GTK window
+just test-cli          # without GTK - the window's state machine still runs
+just test-all          # both
+nix develop -c just smoke   # the three suites below
 ```
 
-- `e2e-smoke.sh` runs a real wayvnc on a headless Sway and drives it with
+- `e2e-smoke.sh` (`just e2e`) runs a real wayvnc on a headless Sway and drives it with
   `scripts/vnc_client.py`, a minimal VeNCrypt client written for these tests
   because no command-line viewer will take a VeNCrypt password
   non-interactively. It completes a genuine X509Plain + TLS 1.3 handshake,
@@ -451,13 +484,13 @@ nix develop -c ./scripts/gui-smoke.sh   # the window, under a headless Sway
   refused when it does not arrive over the required interface — and admitted
   once the real interface is named — that stop revokes immediately, and that
   no credentials are left behind.
-- `tray-smoke.sh` runs the tray on a bus created by `dbus-run-session`, so it
+- `tray-smoke.sh` (`just tray-smoke`) runs the tray on a bus created by `dbus-run-session`, so it
   never touches your real tray, and asserts over D-Bus that the item
   registers, that its icon and `Status` track the session, that a connected
   view-only session renders a different icon from a connected full-control
   one, that the menu reflects the state, and that quitting revokes access and
   stops the daemon.
-- `gui-smoke.sh` opens the window on a headless Sway and checks that it maps,
+- `gui-smoke.sh` (`just gui-smoke`) opens the window on a headless Sway and checks that it maps,
   renders, and follows the daemon's state. A headless wlroots seat has no
   input devices, so synthetic clicking is not possible there - which is why
   the window's behaviour lives in `src/window.rs` as a plain state machine
