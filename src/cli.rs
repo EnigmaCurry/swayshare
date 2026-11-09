@@ -16,9 +16,11 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(
     name = "swayshare",
-    about = "Temporary, peer-scoped remote desktop access for Sway",
-    long_about = "swayshare hands one named peer temporary control of your Sway \
-                  desktop - screen, keyboard and pointer, at the same time as you. \
+    about = "Temporary, peer-scoped remote desktop access for Sway, Hyprland \
+             and other wlroots compositors",
+    long_about = "swayshare hands one named peer temporary control of your \
+                  wlroots (Sway, Hyprland, ...) desktop - screen, keyboard and \
+                  pointer, at the same time as you. \
                   wayvnc carries the desktop over a private Unix socket; swayshare \
                   decides who may reach it, when, and for how long.",
     version

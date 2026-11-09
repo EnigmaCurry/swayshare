@@ -3,7 +3,7 @@
 pkgname=swayshare
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Temporary, peer-scoped remote desktop access for Sway'
+pkgdesc='Temporary, peer-scoped remote desktop access for Sway, Hyprland and other wlroots compositors'
 arch=('x86_64' 'aarch64')
 url='https://github.com/EnigmaCurry/swayshare'
 license=('MIT')
@@ -21,7 +21,8 @@ depends=(
 makedepends=('cargo' 'pkgconf')
 optdepends=(
   'wl-clipboard: copy invitations from the tray menu'
-  'sway: the compositor this is built for (any wlroots one will do)'
+  'sway: a supported wlroots compositor (the reference target)'
+  'hyprland: a supported wlroots compositor (tested)'
 )
 
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
@@ -65,7 +66,7 @@ package() {
 # install above:
 #
 #   pkgname=swayshare-cli
-#   pkgdesc='Temporary, peer-scoped remote desktop access for Sway (no GUI)'
+#   pkgdesc='Temporary, peer-scoped remote desktop access for Sway, Hyprland and other wlroots compositors (no GUI)'
 #   depends=('wayvnc>=0.10.0' 'gcc-libs' 'glibc')
 #   makedepends=('cargo')
 #   provides=('swayshare')

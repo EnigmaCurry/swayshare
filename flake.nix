@@ -49,7 +49,7 @@
 
           meta = with pkgs.lib; {
             description =
-              "Temporary, peer-scoped remote desktop access for Sway"
+              "Temporary, peer-scoped remote desktop access for Sway, Hyprland and other wlroots compositors"
               + optionalString (!withGui) " (without the GTK window)";
             mainProgram = "swayshare";
             platforms = platforms.linux;
@@ -83,6 +83,7 @@
             wayvnc
             wl-clipboard
             sway
+            hyprland
             tigervnc
             grim
             dbus

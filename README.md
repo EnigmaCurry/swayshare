@@ -1,8 +1,15 @@
 # swayshare
 
-Temporary, peer-scoped remote desktop access for [Sway](https://swaywm.org) —
-a "helping hands" tool for when someone you trust needs to sit down at your
-machine and fix something with you.
+Temporary, peer-scoped remote desktop access for [Sway](https://swaywm.org),
+[Hyprland](https://hypr.land) and other
+[wlroots](https://gitlab.freedesktop.org/wlroots/wlroots)-based Wayland
+compositors — a "helping hands" tool for when someone you trust needs to sit
+down at your machine and fix something with you.
+
+Nothing in swayshare is Sway-specific: it supervises `wayvnc`, which runs on
+any compositor that implements the wlroots screencopy and virtual
+pointer/keyboard protocols. Sway is the reference target; Hyprland is tested
+and works.
 
 This is not screen sharing in the presentation sense. The person you invite
 gets a **working desktop**: your screen, your pointer and your keyboard, live
@@ -117,7 +124,7 @@ cargo install swayshare --no-default-features  # CLI and tray only
 From source — `wayvnc` 0.10 or newer must be on `PATH`:
 
 ```sh
-nix develop            # GTK, wayvnc, sway, just and the test tooling
+nix develop            # GTK, wayvnc, sway/hyprland, just and the test tooling
 just build             # with the configuration window
 just build-cli         # without it, and therefore without needing GTK
 ```
@@ -162,6 +169,12 @@ password is valid for this session only, and only connections
 from your own address are accepted (10.0.0.3/32).
 Access expires automatically in 30m.
 ```
+
+**Client choice matters.** wayvnc wraps the session in VeNCrypt x509 TLS plus
+a password. [TigerVNC](https://tigervnc.org) (`vncviewer`) is the tested,
+recommended client. Remmina's VNC plugin is unreliable with this auth scheme
+— it tends to get stuck prompting for CA/client certificates. With TigerVNC
+you only need the server's self-signed cert; no client certificate is used.
 
 ### The tray applet
 

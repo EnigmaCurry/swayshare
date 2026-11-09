@@ -1,4 +1,5 @@
-//! swayshare - temporary, peer-scoped remote desktop access for Sway.
+//! swayshare - temporary, peer-scoped remote desktop access for Sway,
+//! Hyprland and other wlroots-based Wayland compositors.
 //!
 //! wayvnc performs the screen sharing on a Unix socket that has no network
 //! presence; swayshare owns the only path to it and admits exactly one
