@@ -12,12 +12,16 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
 /// How long to wait for wayvnc to create its listening socket.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long to wait for wayvnc's control socket to answer a `client-list`.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub struct Wayvnc {
@@ -220,6 +224,14 @@ impl Wayvnc {
         self.child.wait().await
     }
 
+    /// Number of VNC clients that have completed authentication.
+    ///
+    /// See the free [`authenticated_clients`] function for why this is not the
+    /// same as the number of connected clients.
+    pub async fn authenticated_clients(&self) -> Result<usize> {
+        authenticated_clients(&self.control_socket).await
+    }
+
     /// Stop wayvnc and erase the session credentials from disk.
     ///
     /// SIGKILL rather than SIGTERM: revocation has to be immediate, and wayvnc
@@ -230,6 +242,95 @@ impl Wayvnc {
         paths::remove_if_present(&self.config_file);
         paths::remove_if_present(&self.vnc_socket);
         paths::remove_if_present(&self.control_socket);
+    }
+}
+
+/// Count the VNC clients that have *authenticated*, via wayvnc's control socket.
+///
+/// wayvnc reports a client - both in its `client-connected` event and in
+/// `client-list` - the instant the TCP connection is accepted, before any
+/// password has been checked. The access gate sees the same thing: a bare TCP
+/// connect, indistinguishable from a port scan or a viewer that will fail the
+/// password. So "connected" on its own cannot answer the question that matters,
+/// which is whether someone is actually in.
+///
+/// `client-list` is the one place that can: it fills in a client's `username`
+/// only once that client has passed authentication. neatvnc's only encrypted
+/// security type here is VeNCrypt X509-Plain, which always carries a username,
+/// so a non-empty `username` is an exact, reliable marker of an authenticated
+/// session. We count those.
+pub async fn authenticated_clients(control_socket: &Path) -> Result<usize> {
+    let clients = client_list(control_socket).await?;
+    Ok(clients
+        .iter()
+        .filter(|c| {
+            c.get("username")
+                .and_then(|u| u.as_str())
+                .is_some_and(|u| !u.is_empty())
+        })
+        .count())
+}
+
+/// Fetch wayvnc's current client list over its JSON control socket.
+///
+/// The protocol is one JSON request object in, one JSON response object back
+/// (`{"code":0,"data":[...]}`); there is no framing beyond "a complete JSON
+/// value", so we read until the buffer parses. A whole second query is cheaper
+/// to reason about than a long-lived event subscription, and the daemon only
+/// calls this while a client is connected.
+async fn client_list(control_socket: &Path) -> Result<Vec<serde_json::Value>> {
+    let fut = async {
+        let mut stream = UnixStream::connect(control_socket)
+            .await
+            .context("connecting to the wayvnc control socket")?;
+        stream
+            .write_all(br#"{"method":"client-list"}"#)
+            .await
+            .context("sending client-list to wayvnc")?;
+
+        let mut buf = Vec::with_capacity(512);
+        let mut chunk = [0u8; 512];
+        loop {
+            // A complete object may already be buffered; try before blocking.
+            if let Some(value) = try_parse_object(&buf) {
+                return Ok(value);
+            }
+            let n = stream
+                .read(&mut chunk)
+                .await
+                .context("reading the wayvnc client-list reply")?;
+            if n == 0 {
+                // EOF: parse whatever arrived, or report the truncation.
+                return try_parse_object(&buf)
+                    .context("wayvnc closed the control socket mid-reply");
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    };
+
+    let response: serde_json::Value = tokio::time::timeout(CONTROL_TIMEOUT, fut)
+        .await
+        .context("wayvnc control socket did not answer in time")??;
+
+    match response.get("data") {
+        // `data` is the array for a successful client-list.
+        Some(serde_json::Value::Array(clients)) => Ok(clients.clone()),
+        // An error reply, or a shape we do not recognise: treat as no clients
+        // rather than tearing down a working session over a transient blip.
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Parse one complete JSON object from `buf`, or `None` if it is still partial.
+fn try_parse_object(buf: &[u8]) -> Option<serde_json::Value> {
+    if buf.is_empty() {
+        return None;
+    }
+    match serde_json::from_slice::<serde_json::Value>(buf) {
+        Ok(value) => Some(value),
+        Err(e) if e.is_eof() => None,
+        // Malformed (not just incomplete): nothing more to wait for.
+        Err(_) => None,
     }
 }
 
@@ -329,6 +430,40 @@ mod tests {
             "the session config holds the password in plaintext and must be erased"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_clients_with_a_username_count_as_authenticated() {
+        // A reply mixing an authenticated client (has a username) with a bare
+        // connection (no username yet) must count exactly one.
+        let reply = br#"{"code":0,"data":[
+            {"id":"1","address":"10.0.0.3","username":"support"},
+            {"id":"2","address":"10.0.0.3"},
+            {"id":"3","address":"10.0.0.3","username":""}
+        ]}"#;
+        let response = try_parse_object(reply).expect("a complete reply must parse");
+        let clients = match response.get("data") {
+            Some(serde_json::Value::Array(c)) => c.clone(),
+            other => panic!("expected a data array, got {other:?}"),
+        };
+        let authed = clients
+            .iter()
+            .filter(|c| {
+                c.get("username")
+                    .and_then(|u| u.as_str())
+                    .is_some_and(|u| !u.is_empty())
+            })
+            .count();
+        assert_eq!(authed, 1, "only the client with a non-empty username is in");
+    }
+
+    #[test]
+    fn a_partial_reply_is_not_yet_an_object() {
+        // The leading half of an object must read as "keep waiting", not an
+        // error and not a premature parse.
+        assert!(try_parse_object(br#"{"code":0,"data":["#).is_none());
+        assert!(try_parse_object(b"").is_none());
+        assert!(try_parse_object(br#"{"code":0,"data":[]}"#).is_some());
     }
 
     #[test]

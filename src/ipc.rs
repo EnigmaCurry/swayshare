@@ -86,8 +86,15 @@ pub enum State {
     Off,
     /// Gate bound, one peer authorised, nobody connected yet.
     Listening,
-    /// A remote peer is connected and has keyboard and pointer control.
+    /// A remote peer has opened a connection but has not yet passed the
+    /// password. Nothing is on their screen and nothing is injected until
+    /// they authenticate; this is also what a port scan or a failed attempt
+    /// looks like.
     Connected,
+    /// A remote peer has authenticated: they can now see the screen, and - in
+    /// control mode - drive the keyboard and pointer. This is the state that
+    /// means someone is actually in.
+    Authenticated,
 }
 
 impl std::fmt::Display for State {
@@ -96,6 +103,7 @@ impl std::fmt::Display for State {
             State::Off => f.write_str("off"),
             State::Listening => f.write_str("listening"),
             State::Connected => f.write_str("connected"),
+            State::Authenticated => f.write_str("authenticated"),
         }
     }
 }
@@ -110,6 +118,10 @@ pub struct Status {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
     pub connections: usize,
+    /// How many of `connections` have completed authentication. Defaulted so
+    /// an older daemon that never sent the field still deserialises.
+    #[serde(default)]
+    pub authenticated: usize,
     /// `None` only when nothing is shared.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<AccessMode>,
@@ -125,6 +137,7 @@ impl Status {
             cidr: None,
             listen: None,
             connections: 0,
+            authenticated: 0,
             mode: None,
             expires_in_seconds: None,
         }
@@ -292,6 +305,7 @@ mod tests {
             cidr: Some("10.0.0.3/32".into()),
             listen: Some("10.0.0.10:5900".into()),
             connections: 1,
+            authenticated: 1,
             mode: Some(AccessMode::ViewOnly),
             expires_in_seconds: Some(1800),
         });

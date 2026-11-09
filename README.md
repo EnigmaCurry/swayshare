@@ -182,20 +182,28 @@ you only need the server's self-signed cert; no client certificate is used.
 swayshare tray
 ```
 
-The tray shows a monitor glyph in one of four states:
+The tray shows a monitor glyph in one of five states:
 
 | Glyph | Meaning |
 |---|---|
 | grey, empty | nobody has access |
 | amber, empty | a peer is authorised but has not connected |
-| blue, with a dot | connected, **view only** — they can see but not type |
-| red, filled | connected with **full control** |
+| cyan, empty | a connection is open but has **not authenticated** yet — nothing is shared |
+| blue, with a dot | authenticated, **view only** — they can see but not type |
+| red, filled | authenticated with **full control** |
+
+Connecting and authenticating are kept apart on purpose. A bare TCP
+connection — which is also what a port scan or a wrong-password attempt looks
+like — shows as the quiet cyan glyph and does **not** raise the bar's
+attention state, because nothing is on anyone's screen until the password is
+accepted. Only once a client authenticates does the glyph turn blue or red and
+the bar demand attention.
 
 The states differ in shape as well as colour, so the two distinctions that
-matter — whether anyone is connected, and whether they can type — survive not
-being able to tell blue from red. Both connected states are reported to the
-bar as needing attention and will not be quietly hidden: a view-only peer
-still sees everything on your screen.
+matter — whether anyone is actually in, and whether they can type — survive
+not being able to tell blue from red. Both authenticated states are reported
+to the bar as needing attention and will not be quietly hidden: a view-only
+peer still sees everything on your screen.
 
 Its menu has one submenu per access mode — *Hand the controls to* and *Grant
 view-only access to* — and entries to copy the invitation, revoke access, and
@@ -232,9 +240,16 @@ Sessions are started from the CLI or the tray applet. `swayshare status --json`
 is meant for a status bar:
 
 ```json
-{"state":"connected","peer":"mike","cidr":"10.0.0.3/32",
- "listen":"10.0.0.10:5900","connections":1,"expires_in_seconds":1583}
+{"state":"authenticated","peer":"mike","cidr":"10.0.0.3/32",
+ "listen":"10.0.0.10:5900","connections":1,"authenticated":1,
+ "expires_in_seconds":1583}
 ```
+
+`state` is one of `off`, `listening`, `connected`, or `authenticated`.
+`connected` means a TCP connection is open but has not passed the password, so
+nothing is shared yet; `authenticated` means a client is actually in. The
+`connections` field counts open connections and `authenticated` counts how
+many of those have logged in.
 
 While someone else is driving, your own Sway bindings still reach Sway — their
 input and yours are merged into the same seat. If you want to stop your

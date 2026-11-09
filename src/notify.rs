@@ -32,24 +32,36 @@ pub fn session_started(peer: &str, listen: &str, mode: AccessMode) {
     );
 }
 
-pub fn client_connected(peer: &str, ip: &str, mode: AccessMode) {
-    // The notification that must not be missed. It names what the peer can
-    // actually do, because "connected" alone does not tell you whether your
-    // keyboard is now shared.
+pub fn client_connecting(peer: &str, ip: &str) {
+    // A connection has opened but the password has not been checked yet, so
+    // nothing is shared and nothing is injected. Deliberately low-key: this is
+    // also what a port scan or a wrong-password attempt looks like, and the
+    // loud alert is reserved for authentication actually succeeding.
+    send(
+        "Someone is connecting".into(),
+        format!("{peer} connected from {ip} and is authenticating. Nothing is shared yet."),
+        false,
+    );
+}
+
+pub fn client_authenticated(peer: &str, mode: AccessMode) {
+    // The notification that must not be missed: the peer has passed the
+    // password and is now actually in. It names what they can do, because
+    // "authenticated" alone does not tell you whether your keyboard is shared.
     let (summary, body) = match mode {
         AccessMode::Control => (
             "Someone is controlling your desktop",
-            format!("{peer} connected from {ip} and now has keyboard and pointer control."),
+            format!("{peer} authenticated and now has keyboard and pointer control."),
         ),
         AccessMode::ViewOnly => (
             "Someone is watching your screen",
-            format!("{peer} connected from {ip}. View only - they cannot type or click."),
+            format!("{peer} authenticated. View only - they cannot type or click."),
         ),
     };
     send(summary.into(), body, true);
 }
 
-pub fn client_disconnected(peer: &str, mode: AccessMode) {
+pub fn client_left(peer: &str, mode: AccessMode) {
     let summary = match mode {
         AccessMode::Control => "You have the controls back",
         AccessMode::ViewOnly => "Nobody is watching",

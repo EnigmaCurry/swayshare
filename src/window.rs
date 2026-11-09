@@ -149,7 +149,8 @@ impl Model {
         match self.status.state {
             State::Off => "Remote access off",
             State::Listening => "Access granted - waiting for them to connect",
-            State::Connected => match self.status.mode {
+            State::Connected => "Someone connected - waiting for them to authenticate",
+            State::Authenticated => match self.status.mode {
                 Some(AccessMode::ViewOnly) => "Someone is watching your screen",
                 _ => "Someone is controlling your desktop",
             },
@@ -434,7 +435,12 @@ mod tests {
             peer: Some(peer.into()),
             cidr: Some("10.0.0.3/32".into()),
             listen: Some("10.0.0.10:5900".into()),
-            connections: if state == State::Connected { 1 } else { 0 },
+            connections: if matches!(state, State::Off | State::Listening) {
+                0
+            } else {
+                1
+            },
+            authenticated: if state == State::Authenticated { 1 } else { 0 },
             mode: Some(mode),
             expires_in_seconds: Some(1800),
         }
@@ -824,12 +830,12 @@ mod tests {
         assert_eq!(m.heading(), "Remote access off");
         reduce(
             &mut m,
-            Event::StatusPolled(status(State::Connected, "mike", AccessMode::Control)),
+            Event::StatusPolled(status(State::Authenticated, "mike", AccessMode::Control)),
         );
         assert_eq!(m.heading(), "Someone is controlling your desktop");
         reduce(
             &mut m,
-            Event::StatusPolled(status(State::Connected, "mike", AccessMode::ViewOnly)),
+            Event::StatusPolled(status(State::Authenticated, "mike", AccessMode::ViewOnly)),
         );
         assert_eq!(m.heading(), "Someone is watching your screen");
     }

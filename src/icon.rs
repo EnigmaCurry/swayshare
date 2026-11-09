@@ -21,6 +21,9 @@ pub enum Indicator {
     Off,
     /// A peer is authorised but has not connected yet.
     Waiting,
+    /// A connection is open but has not authenticated: no screen is shared and
+    /// no input reaches the desktop. Visually quiet - nobody is in yet.
+    Connecting,
     /// Connected, view only: they can see but not type.
     Watching,
     /// Connected with keyboard and pointer control.
@@ -32,8 +35,11 @@ impl Indicator {
         match (status.state, status.mode) {
             (State::Off, _) => Indicator::Off,
             (State::Listening, _) => Indicator::Waiting,
-            (State::Connected, Some(AccessMode::ViewOnly)) => Indicator::Watching,
-            (State::Connected, _) => Indicator::Controlling,
+            // Connected but not yet authenticated: nobody is actually in, so
+            // this must not show as watching or controlling.
+            (State::Connected, _) => Indicator::Connecting,
+            (State::Authenticated, Some(AccessMode::ViewOnly)) => Indicator::Watching,
+            (State::Authenticated, _) => Indicator::Controlling,
         }
     }
 
@@ -47,6 +53,7 @@ impl Indicator {
         match self {
             Indicator::Off => 0x9a_a0_a6,         // grey
             Indicator::Waiting => 0xf5_a6_23,     // amber
+            Indicator::Connecting => 0x00_bc_d4,  // cyan
             Indicator::Watching => 0x42_8f_f5,    // blue
             Indicator::Controlling => 0xe5_39_35, // red
         }
@@ -54,8 +61,9 @@ impl Indicator {
 
     fn fill(self) -> Fill {
         match self {
-            // Nobody is connected: an empty screen.
-            Indicator::Off | Indicator::Waiting => Fill::Hollow,
+            // Nobody is in: an empty screen. Connecting shares the shape and
+            // stands apart by colour, like off and waiting do.
+            Indicator::Off | Indicator::Waiting | Indicator::Connecting => Fill::Hollow,
             // Someone is looking: an eye in the middle of the screen.
             Indicator::Watching => Fill::Dot,
             // Someone is driving: the screen is solid.
@@ -152,9 +160,10 @@ fn draw(size: i32, colour: u32, fill: Fill) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    const ALL: [Indicator; 4] = [
+    const ALL: [Indicator; 5] = [
         Indicator::Off,
         Indicator::Waiting,
+        Indicator::Connecting,
         Indicator::Watching,
         Indicator::Controlling,
     ];
@@ -175,7 +184,12 @@ mod tests {
             peer: Some("mike".into()),
             cidr: Some("10.0.0.3/32".into()),
             listen: Some("10.0.0.10:5900".into()),
-            connections: if state == State::Connected { 1 } else { 0 },
+            connections: if matches!(state, State::Off | State::Listening) {
+                0
+            } else {
+                1
+            },
+            authenticated: if state == State::Authenticated { 1 } else { 0 },
             mode,
             expires_in_seconds: None,
         }
@@ -199,7 +213,7 @@ mod tests {
     fn every_state_is_a_different_colour() {
         let colours: std::collections::HashSet<u32> =
             ALL.into_iter().map(Indicator::colour).collect();
-        assert_eq!(colours.len(), 4, "states must be visually distinguishable");
+        assert_eq!(colours.len(), 5, "states must be visually distinguishable");
     }
 
     #[test]
@@ -287,12 +301,22 @@ mod tests {
             Indicator::from_status(&status(State::Listening, Some(AccessMode::Control))),
             Indicator::Waiting
         );
+        // Connected but not authenticated reads as connecting, in either mode:
+        // nobody is in yet.
         assert_eq!(
             Indicator::from_status(&status(State::Connected, Some(AccessMode::ViewOnly))),
-            Indicator::Watching
+            Indicator::Connecting
         );
         assert_eq!(
             Indicator::from_status(&status(State::Connected, Some(AccessMode::Control))),
+            Indicator::Connecting
+        );
+        assert_eq!(
+            Indicator::from_status(&status(State::Authenticated, Some(AccessMode::ViewOnly))),
+            Indicator::Watching
+        );
+        assert_eq!(
+            Indicator::from_status(&status(State::Authenticated, Some(AccessMode::Control))),
             Indicator::Controlling
         );
     }
@@ -302,16 +326,18 @@ mod tests {
         // Fail towards the louder indication: if we cannot tell, assume the
         // peer can type rather than quietly implying they cannot.
         assert_eq!(
-            Indicator::from_status(&status(State::Connected, None)),
+            Indicator::from_status(&status(State::Authenticated, None)),
             Indicator::Controlling
         );
     }
 
     #[test]
-    fn both_connected_states_count_as_connected() {
+    fn only_authenticated_states_count_as_connected() {
         assert!(Indicator::Watching.is_connected());
         assert!(Indicator::Controlling.is_connected());
         assert!(!Indicator::Off.is_connected());
         assert!(!Indicator::Waiting.is_connected());
+        // A mere connection has not raised anyone onto the desktop.
+        assert!(!Indicator::Connecting.is_connected());
     }
 }

@@ -129,6 +129,10 @@ impl SwayshareTray {
             },
             State::Connected => {
                 let who = self.status.peer.as_deref().unwrap_or("Someone");
+                format!("{who} is connecting (authenticating)")
+            }
+            State::Authenticated => {
+                let who = self.status.peer.as_deref().unwrap_or("Someone");
                 match self.status.mode {
                     Some(AccessMode::ViewOnly) => format!("{who} is watching"),
                     _ => format!("{who} has the controls"),
@@ -592,7 +596,12 @@ mod tests {
             peer: Some(peer.to_string()),
             cidr: Some("10.0.0.3/32".into()),
             listen: Some("10.0.0.10:5900".into()),
-            connections: if state == State::Connected { 1 } else { 0 },
+            connections: if matches!(state, State::Off | State::Listening) {
+                0
+            } else {
+                1
+            },
+            authenticated: if state == State::Authenticated { 1 } else { 0 },
             mode: Some(mode),
             expires_in_seconds: Some(1800),
         }
@@ -691,18 +700,26 @@ mod tests {
     }
 
     #[test]
-    fn connected_state_says_who_is_driving() {
-        let tray = tray_with(active_status(State::Connected, "mike"), &[]);
+    fn authenticated_state_says_who_is_driving() {
+        let tray = tray_with(active_status(State::Authenticated, "mike"), &[]);
         assert_eq!(tray.summary(), "mike has the controls");
         assert!(find(&labels(&tray), "mike has the controls").is_some());
 
         // The view-only session reads differently, because the difference
         // matters more than anything else the tray reports.
         let watching = tray_with(
-            status_with(State::Connected, "mike", AccessMode::ViewOnly),
+            status_with(State::Authenticated, "mike", AccessMode::ViewOnly),
             &[],
         );
         assert_eq!(watching.summary(), "mike is watching");
+    }
+
+    #[test]
+    fn a_bare_connection_reads_as_connecting_not_controlling() {
+        // The whole point: a TCP connection that has not passed the password
+        // must not claim anyone has the controls.
+        let tray = tray_with(active_status(State::Connected, "mike"), &[]);
+        assert_eq!(tray.summary(), "mike is connecting (authenticating)");
     }
 
     #[test]
@@ -745,8 +762,14 @@ mod tests {
             tray_with(active_status(State::Listening, "mike"), &[]).status(),
             ksni::Status::Active
         ));
+        // A bare connection has not put anyone on the desktop yet.
         assert!(matches!(
             tray_with(active_status(State::Connected, "mike"), &[]).status(),
+            ksni::Status::Active
+        ));
+        // Authentication is the point at which attention is demanded.
+        assert!(matches!(
+            tray_with(active_status(State::Authenticated, "mike"), &[]).status(),
             ksni::Status::NeedsAttention
         ));
     }
@@ -807,11 +830,11 @@ mod tests {
     fn the_icon_distinguishes_watching_from_controlling() {
         use ksni::Tray;
         let watching = tray_with(
-            status_with(State::Connected, "mike", AccessMode::ViewOnly),
+            status_with(State::Authenticated, "mike", AccessMode::ViewOnly),
             &[],
         );
         let controlling = tray_with(
-            status_with(State::Connected, "mike", AccessMode::Control),
+            status_with(State::Authenticated, "mike", AccessMode::Control),
             &[],
         );
         assert_ne!(

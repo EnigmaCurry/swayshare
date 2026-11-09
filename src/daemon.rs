@@ -21,11 +21,18 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 /// How long to wait for wayvnc to actually be gone before reporting a stop.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// How often to ask wayvnc whether a connected client has authenticated yet.
+///
+/// Authentication has no event of its own, so the state is discovered by
+/// polling `client-list`. Short enough that the "someone is in" notification
+/// does not lag perceptibly behind the password being accepted.
+const AUTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Everything belonging to one sharing session.
 ///
@@ -46,12 +53,23 @@ struct ActiveSession {
     /// Resolves once wayvnc is confirmed dead and its config file erased.
     wayvnc_done: oneshot::Receiver<()>,
     connections: usize,
+    /// How many connected clients have passed authentication. Distinct from
+    /// `connections`, which counts bare TCP connections the moment they are
+    /// admitted - before any password is checked.
+    authenticated: usize,
+    /// Whether the "someone is in" notification has fired for the current
+    /// occupant, so the matching "they are gone" notification fires once too.
+    announced_auth: bool,
     expires_at: Option<Instant>,
 }
 
 /// Internal events folded into the daemon's single event loop.
 enum Event {
     Gate(GateEvent),
+    /// The authenticated-client count reported by the wayvnc monitor changed.
+    Auth {
+        authenticated: usize,
+    },
     /// wayvnc exited without being asked to.
     WayvncExited(String),
 }
@@ -185,7 +203,11 @@ impl Daemon {
         match &self.session {
             None => Status::off(),
             Some(s) => Status {
-                state: if s.connections > 0 {
+                // Authentication outranks a bare connection: a connected peer
+                // who has not yet passed the password is not "in" yet.
+                state: if s.authenticated > 0 {
+                    State::Authenticated
+                } else if s.connections > 0 {
                     State::Connected
                 } else {
                     State::Listening
@@ -194,6 +216,7 @@ impl Daemon {
                 cidr: Some(s.peer.cidr.to_string()),
                 listen: Some(s.listen.to_string()),
                 connections: s.connections,
+                authenticated: s.authenticated,
                 mode: Some(s.mode),
                 expires_in_seconds: s.remaining_seconds(),
             },
@@ -264,6 +287,7 @@ impl Daemon {
         };
 
         let vnc_socket = wayvnc.vnc_socket.clone();
+        let control_socket = wayvnc.control_socket.clone();
         let (revoker, cancel) = Revoker::new();
 
         // The supervisor task owns the child so the event loop can learn about
@@ -307,8 +331,14 @@ impl Daemon {
             },
             vnc_socket,
             gate_events,
-            cancel,
+            cancel.clone(),
         ));
+
+        // Watch wayvnc for authentication. The gate can only see TCP connects;
+        // whether a connected peer has actually passed the password lives in
+        // wayvnc, which has no event for it - hence the poll. Shares the
+        // session's cancellation, so it stops the instant access is revoked.
+        tokio::spawn(monitor_auth(control_socket, self.events.clone(), cancel));
 
         let minutes = minutes.unwrap_or(cfg.security.default_session_minutes);
         let expires_at = (minutes > 0).then(|| Instant::now() + Duration::from_secs(minutes * 60));
@@ -324,6 +354,8 @@ impl Daemon {
             wayvnc_stop: Some(stop_tx),
             wayvnc_done: done_rx,
             connections: 0,
+            authenticated: 0,
+            announced_auth: false,
             expires_at,
         };
 
@@ -371,18 +403,46 @@ impl Daemon {
             Event::Gate(GateEvent::Accepted { ip, active }) => {
                 if let Some(s) = &mut self.session {
                     s.connections = active;
-                    eprintln!(
-                        "swayshare: {ip} connected ({active} active, {})",
-                        s.mode.label()
-                    );
-                    notify::client_connected(&s.peer.name, &ip.to_string(), s.mode);
+                    // A TCP connection, not yet a session: no screen is shared
+                    // and no input is injected until the password is accepted.
+                    eprintln!("swayshare: {ip} connected, awaiting authentication ({active} open)");
+                    notify::client_connecting(&s.peer.name, &ip.to_string());
                 }
             }
             Event::Gate(GateEvent::Closed { ip, active }) => {
                 if let Some(s) = &mut self.session {
                     s.connections = active;
-                    eprintln!("swayshare: {ip} disconnected ({active} active)");
-                    notify::client_disconnected(&s.peer.name, s.mode);
+                    eprintln!("swayshare: {ip} disconnected ({active} open)");
+                    // No connections left means nobody is authenticated either;
+                    // announce their departure if we announced their arrival.
+                    if active == 0 {
+                        s.authenticated = 0;
+                        if s.announced_auth {
+                            s.announced_auth = false;
+                            notify::client_left(&s.peer.name, s.mode);
+                        }
+                    }
+                }
+            }
+            Event::Auth { authenticated } => {
+                if let Some(s) = &mut self.session {
+                    s.authenticated = authenticated;
+                    if authenticated > 0 && !s.announced_auth {
+                        // The rising edge: someone is now actually in. This is
+                        // the alert that matters, and the only one that names
+                        // what they can do.
+                        s.announced_auth = true;
+                        eprintln!(
+                            "swayshare: {} authenticated ({})",
+                            s.peer.name,
+                            s.mode.label()
+                        );
+                        notify::client_authenticated(&s.peer.name, s.mode);
+                    } else if authenticated == 0 && s.announced_auth {
+                        s.announced_auth = false;
+                        eprintln!("swayshare: {} is no longer authenticated", s.peer.name);
+                        notify::client_left(&s.peer.name, s.mode);
+                    }
                 }
             }
             Event::Gate(GateEvent::Rejected { ip, decision }) => {
@@ -422,6 +482,42 @@ impl ActiveSession {
             fingerprint: self.fingerprint.clone(),
             mode: self.mode,
             expires_in_seconds: self.remaining_seconds(),
+        }
+    }
+}
+
+/// Poll wayvnc for the authenticated-client count until access is revoked.
+///
+/// Authentication is the one piece of session state wayvnc exposes only on
+/// request, not as an event, so it is discovered by asking `client-list` on a
+/// timer. Only changes are forwarded, to keep the daemon's log and
+/// notifications quiet. A failed query is swallowed and retried: a transient
+/// hiccup talking to the control socket must not be mistaken for "nobody is
+/// authenticated", which would wrongly clear the on-screen warning.
+async fn monitor_auth(
+    control_socket: PathBuf,
+    events: mpsc::Sender<Event>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    let mut last: Option<usize> = None;
+    let mut tick = tokio::time::interval(AUTH_POLL_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.changed() => break,
+            _ = tick.tick() => {
+                match crate::wayvnc::authenticated_clients(&control_socket).await {
+                    Ok(n) if last != Some(n) => {
+                        last = Some(n);
+                        if events.send(Event::Auth { authenticated: n }).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
         }
     }
 }
@@ -525,7 +621,10 @@ pub fn render_status(status: &Status) -> String {
     match status.state {
         State::Off => out.push_str("Remote access is off\n"),
         State::Listening => out.push_str("Access granted - waiting for them to connect\n"),
-        State::Connected => match status.mode {
+        State::Connected => {
+            out.push_str("Someone has connected - waiting for them to authenticate\n")
+        }
+        State::Authenticated => match status.mode {
             Some(AccessMode::ViewOnly) => out.push_str("Someone is watching your screen\n"),
             _ => out.push_str("Someone is controlling your desktop\n"),
         },
@@ -540,7 +639,10 @@ pub fn render_status(status: &Status) -> String {
         out.push_str(&format!("  Listening:   {listen}\n"));
     }
     if status.state != State::Off {
-        out.push_str(&format!("  Connections: {}\n", status.connections));
+        out.push_str(&format!(
+            "  Connections: {} ({} authenticated)\n",
+            status.connections, status.authenticated
+        ));
     }
     if let Some(secs) = status.expires_in_seconds {
         out.push_str(&format!("  Expires in:  {}\n", invite::humanize(secs)));

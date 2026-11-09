@@ -4,8 +4,8 @@
 #
 # Checks that the StatusNotifierItem really is exported and that it reflects
 # the daemon's state: the icon changes when sharing starts, the item asks for
-# attention while someone is connected, and the menu enables/disables the
-# right entries.
+# attention only once someone has *authenticated* (a bare connection does not),
+# and the menu enables/disables the right entries.
 #
 # It runs under `dbus-run-session`, so it never registers an icon on your real
 # session bus or disturbs your actual tray.
@@ -155,7 +155,10 @@ if [ -n "$LIVE" ]; then
   echo "$LAYOUT_ON" | grep -q "Waiting for tester to connect" \
     && pass "menu header tracks the session" || fail "menu header did not update"
 
-  echo "== connect, and the item should demand attention =="
+  echo "== a bare connection must NOT yet demand attention =="
+  # A raw TCP connect that never authenticates - what a port scan or a
+  # wrong-password attempt looks like. It must read as "connecting", not as
+  # someone being in: no attention, and no claim that they have the controls.
   python3 - "$PORT" <<'PY' &
 import socket, sys, time
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
@@ -163,17 +166,32 @@ s.recv(12)
 time.sleep(6)   # hold the connection open while the tray is inspected
 s.close()
 PY
+  PROBE=$!
+  sleep 3
+  case "$(prop Status)" in
+    *NeedsAttention*) fail "a bare connection must not demand attention: $(prop Status)" ;;
+    *) pass "an unauthenticated connection stays Active, not NeedsAttention" ;;
+  esac
+  echo "$(menu_layout)" | grep -q "is connecting" \
+    && pass "menu says they are still connecting" \
+    || fail "menu claimed control before authentication: $(menu_layout)"
+  wait $PROBE 2>/dev/null
+
+  echo "== authenticate, and the item should demand attention =="
+  python3 "$CLIENT" --port "$PORT" \
+    --password "$("$BIN" invite | grep '^Password:' | awk '{print $2}')" \
+    --ca "$XDG_DATA_HOME/swayshare/tls/cert.pem" --hold 6 >/dev/null 2>&1 &
   VIEWER=$!
   sleep 3
   case "$(prop Status)" in
-    *NeedsAttention*) pass "Status is NeedsAttention while connected" ;;
-    *) fail "expected NeedsAttention while connected, got: $(prop Status)" ;;
+    *NeedsAttention*) pass "Status is NeedsAttention once authenticated" ;;
+    *) fail "expected NeedsAttention once authenticated, got: $(prop Status)" ;;
   esac
   ICON_CONN=$(icon_digest)
-  [ "$ICON_CONN" != "$ICON_ON" ] && pass "icon changed again on connect ($ICON_CONN)" \
-    || fail "icon did not change on connect"
+  [ "$ICON_CONN" != "$ICON_ON" ] && pass "icon changed again on authentication ($ICON_CONN)" \
+    || fail "icon did not change on authentication"
   echo "$(menu_layout)" | grep -q "has the controls" \
-    && pass "menu says who has the controls" || fail "menu did not report the connected peer"
+    && pass "menu says who has the controls" || fail "menu did not report the authenticated peer"
   wait $VIEWER 2>/dev/null
 
   echo "== a view-only session must look different from a control session =="
