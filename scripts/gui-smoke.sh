@@ -85,6 +85,10 @@ if [ "$APP_ID" = "tech.rymcg.swayshare" ]; then
   pass "window mapped as $APP_ID"
 else
   fail "the configuration window never appeared"
+  if grep -q "built without the configuration window" "$SB/gui.log"; then
+    echo "  cause: $BIN was built without the gui feature."
+    echo "  A --no-default-features build writes to the same path; run: cargo build"
+  fi
   echo "--- gui log ---"; cat "$SB/gui.log"; exit 1
 fi
 sleep 2.5

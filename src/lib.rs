@@ -22,3 +22,6 @@ pub mod paths;
 pub mod secret;
 pub mod tray;
 pub mod wayvnc;
+/// Window state, deliberately not behind the `gui` feature so it is tested
+/// even in a build without GTK.
+pub mod window;

@@ -396,10 +396,17 @@ nix develop -c ./scripts/gui-smoke.sh   # the window, under a headless Sway
   one, that the menu reflects the state, and that quitting revokes access and
   stops the daemon.
 - `gui-smoke.sh` opens the window on a headless Sway and checks that it maps,
-  renders, and follows the daemon's state. Note that a headless wlroots seat
-  has no input devices, so synthetic clicking is not possible there: the logic
-  behind each control is covered by unit and integration tests instead, and
-  this script covers the rendering and polling that those cannot reach.
+  renders, and follows the daemon's state. A headless wlroots seat has no
+  input devices, so synthetic clicking is not possible there - which is why
+  the window's behaviour lives in `src/window.rs` as a plain state machine
+  with no GTK in it. `reduce()` folds an event into the model and returns the
+  effects to perform, so every control can be exercised directly: what a click
+  on *Add* does with a malformed CIDR, that a selection left pointing past the
+  end of a shortened peer list is dropped rather than reinterpreted, that an
+  invitation is fetched once per session and not once per poll. Those tests
+  need no display at all, and run in the `--no-default-features` build too.
+  `src/gui.rs` is then only the translation between that model and GTK, with a
+  single `render()` that writes the whole model onto the widgets.
 
 ## Roadmap
 
