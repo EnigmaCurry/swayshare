@@ -149,22 +149,35 @@ fn an_absent_daemon_is_reported_clearly() {
 
 #[test]
 fn shutdown_stops_the_daemon() {
-    let mut sb = Sandbox::new("shutdown");
-    sb.start_daemon();
+    // Repeated because the bug this guards against is a race, not a logic
+    // error: the reply is written by a different task from the one that
+    // decides to exit, and returning from `run` drops the runtime. A single
+    // attempt passed on an idle laptop and failed on a loaded CI runner.
+    for attempt in 1..=5 {
+        let mut sb = Sandbox::new(&format!("shutdown-{attempt}"));
+        sb.start_daemon();
 
-    ipc::blocking::request(&sb.socket(), &Request::Shutdown)
-        .and_then(ipc::expect_ok)
-        .expect("shutdown should be accepted");
+        // The reply has to arrive, not merely be sent: a client that sees a
+        // closed connection cannot tell a successful shutdown from a crash.
+        ipc::blocking::request(&sb.socket(), &Request::Shutdown)
+            .and_then(ipc::expect_ok)
+            .unwrap_or_else(|e| panic!("attempt {attempt}: shutdown should be accepted: {e:#}"));
 
-    // The daemon removes its socket on the way out.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if std::os::unix::net::UnixStream::connect(sb.socket()).is_err() {
-            return;
+        // The daemon removes its socket on the way out.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut gone = false;
+        while Instant::now() < deadline {
+            if std::os::unix::net::UnixStream::connect(sb.socket()).is_err() {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            gone,
+            "attempt {attempt}: the control socket still answers after shutdown"
+        );
     }
-    panic!("the control socket still answers after shutdown");
 }
 
 #[test]

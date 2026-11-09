@@ -65,8 +65,22 @@ pub struct Daemon {
     shutdown_requested: bool,
 }
 
-/// A control-socket request paired with the channel its reply goes back on.
-type Call = (Request, oneshot::Sender<Response>);
+/// How long the shutdown path waits for a reply to reach the client.
+const REPLY_FLUSH_GRACE: Duration = Duration::from_secs(2);
+
+/// A control-socket request, the channel its reply goes back on, and an
+/// acknowledgement that the reply actually reached the socket.
+struct Call {
+    request: Request,
+    reply: oneshot::Sender<Response>,
+    /// Resolves once [`serve_call`] has flushed the reply.
+    ///
+    /// Only the shutdown path waits on this, and it has to: the reply is
+    /// written by a separate task, and returning from `run` drops the tokio
+    /// runtime, which aborts that task. Without the wait, a shutdown that
+    /// succeeded reports itself to the client as a dropped connection.
+    written: oneshot::Receiver<()>,
+}
 
 impl Daemon {
     /// Bind the control socket and run until told to shut down.
@@ -105,10 +119,14 @@ impl Daemon {
             let deadline = daemon.session.as_ref().and_then(|s| s.expires_at);
 
             tokio::select! {
-                Some((req, reply)) = calls_rx.recv() => {
-                    let resp = daemon.handle(req).await;
-                    let _ = reply.send(resp);
+                Some(call) = calls_rx.recv() => {
+                    let resp = daemon.handle(call.request).await;
+                    let _ = call.reply.send(resp);
                     if daemon.shutdown_requested {
+                        // Let the reply reach the client before the runtime
+                        // goes away underneath the task that writes it.
+                        let _ =
+                            tokio::time::timeout(REPLY_FLUSH_GRACE, call.written).await;
                         break;
                     }
                 }
@@ -459,10 +477,19 @@ async fn serve_call(stream: UnixStream, calls: mpsc::Sender<Call>) -> Result<()>
         return Ok(());
     }
 
+    // Handed to the daemon so the shutdown path can tell when this reply has
+    // been written; dropping it without sending resolves the wait too.
+    let (written_tx, written_rx) = oneshot::channel();
+
     let response = match serde_json::from_str::<Request>(line.trim_end()) {
         Ok(req) => {
             let (tx, rx) = oneshot::channel();
-            if calls.send((req, tx)).await.is_err() {
+            let call = Call {
+                request: req,
+                reply: tx,
+                written: written_rx,
+            };
+            if calls.send(call).await.is_err() {
                 Response::Error {
                     message: "the daemon is shutting down".into(),
                 }
@@ -481,6 +508,7 @@ async fn serve_call(stream: UnixStream, calls: mpsc::Sender<Call>) -> Result<()>
     text.push('\n');
     write_half.write_all(text.as_bytes()).await?;
     write_half.flush().await?;
+    let _ = written_tx.send(());
     Ok(())
 }
 
