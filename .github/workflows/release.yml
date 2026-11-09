@@ -1,0 +1,199 @@
+# Release pipeline for swayshare.
+#
+# Deliberately uses only actions/checkout and the preinstalled `gh` CLI. This
+# is the build path for a tool that grants remote control of a desktop, so the
+# fewer third-party actions with access to it, the better.
+#
+# What gets published is a statically linked swayshare-cli: the CLI and tray
+# without the GTK window. That build links nothing but libc, so a musl target
+# makes it a single file that runs on any Linux. The GTK build is deliberately
+# not shipped as a binary - a dynamically linked GTK application is not
+# portable, and distribution packaging is the right channel for it.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and release'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  verify:
+    name: tests and lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install GTK development files
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libgtk-4-dev
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # Both feature sets, because they compile different code: the GTK shell
+      # only exists in one of them, and the window's state machine must build
+      # and pass in both.
+      - name: Clippy (with the GTK window)
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Tests (with the GTK window)
+        run: cargo test --locked
+
+      - name: Clippy (without GTK)
+        run: cargo clippy --all-targets --locked --no-default-features -- -D warnings
+      - name: Tests (without GTK)
+        run: cargo test --locked --no-default-features
+
+  build:
+    name: static binary
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install the musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools
+          rustup target add "$TARGET"
+
+      - name: Build
+        run: cargo build --release --locked --no-default-features --target "$TARGET"
+
+      # The point of this artifact is that it has no runtime dependencies.
+      # Assert it rather than assume it: a dynamically linked binary here would
+      # silently defeat the entire reason for shipping it.
+      - name: Check the binary really is static
+        run: |
+          bin="target/$TARGET/release/swayshare"
+          file "$bin"
+          # Depending on whether rustc emits static-pie, ldd says either
+          # "not a dynamic executable" or "statically linked". Anything else
+          # means we have dynamic dependencies.
+          out=$(ldd "$bin" 2>&1 || true)
+          case "$out" in
+            *"not a dynamic executable"*|*"statically linked"*)
+              echo "no dynamic dependencies: $out" ;;
+            *)
+              echo "::error::$bin has dynamic dependencies:"
+              echo "$out"
+              exit 1 ;;
+          esac
+
+      - name: Smoke-test the binary
+        run: |
+          bin="target/$TARGET/release/swayshare"
+          "$bin" --version
+          "$bin" --help > /dev/null
+          # The GUI subcommand must refuse cleanly rather than crash.
+          if "$bin" gui 2>&1 | grep -q 'built without the configuration window'; then
+            echo "gui refuses cleanly in the no-GTK build"
+          else
+            echo '::error::the no-GTK build did not refuse gui as expected'
+            exit 1
+          fi
+
+      - name: Package
+        id: package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          dispatch_tag="${{ github.event.inputs.tag }}"
+          if [ -n "$dispatch_tag" ]; then
+            version="${dispatch_tag#v}"
+          fi
+          name="swayshare-cli-${version}-x86_64-linux-musl"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/swayshare" "dist/$name/swayshare"
+          strip "dist/$name/swayshare"
+          cp README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist
+
+      # The AUR PKGBUILD needs the checksum of GitHub's generated source
+      # tarball. Compute it here so updating the package is copy and paste
+      # rather than a separate manual step.
+      - name: Checksum the source tarball
+        id: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          url="${{ github.server_url }}/${{ github.repository }}/archive/refs/tags/${tag}.tar.gz"
+          curl -fsSL --retry 3 -o source.tar.gz "$url"
+          echo "sha256=$(sha256sum source.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.src.outputs.tag }}"
+          {
+            echo "## Installing"
+            echo
+            echo 'The attached binary is **swayshare-cli**: the command line and the'
+            echo 'tray applet, statically linked, with no runtime dependencies of its'
+            echo 'own. It still needs **wayvnc 0.10 or newer** on `PATH`, because that'
+            echo 'is what actually carries the desktop.'
+            echo
+            echo 'The GTK configuration window is not shipped as a binary - a'
+            echo 'dynamically linked GTK application is not portable. Build it from'
+            echo 'source or install a distribution package for that.'
+            echo
+            echo '```sh'
+            echo "tar xzf swayshare-cli-${tag#v}-x86_64-linux-musl.tar.gz"
+            echo "sudo install -m0755 swayshare-cli-${tag#v}-x86_64-linux-musl/swayshare /usr/local/bin/"
+            echo 'swayshare --help'
+            echo '```'
+            echo
+            echo "### For the AUR package"
+            echo
+            echo 'Source tarball checksum for `packaging/aur/PKGBUILD`:'
+            echo
+            echo '```'
+            echo "sha256sums=('${{ steps.src.outputs.sha256 }}')"
+            echo '```'
+          } > notes.md
+          gh release create "$tag" \
+            --title "$tag" \
+            --notes-file notes.md \
+            --verify-tag \
+            dist/*.tar.gz dist/*.sha256

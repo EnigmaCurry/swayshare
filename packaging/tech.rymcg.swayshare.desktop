@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=swayshare
+GenericName=Remote Desktop Access
+Comment=Grant someone you trust temporary control of your Sway desktop
+Exec=swayshare gui
+Icon=video-display
+Terminal=false
+Categories=Network;RemoteAccess;System;
+Keywords=vnc;remote;desktop;support;screen;sharing;
+StartupNotify=true
+# Matches the application_id the window sets, so the compositor can associate
+# the window with this entry.
+StartupWMClass=tech.rymcg.swayshare

@@ -1,0 +1,76 @@
+# Maintainer: EnigmaCurry <enigmacurry@users.noreply.github.com>
+
+pkgname=swayshare
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Temporary, peer-scoped remote desktop access for Sway'
+arch=('x86_64' 'aarch64')
+url='https://github.com/EnigmaCurry/swayshare'
+license=('MIT')
+
+# wayvnc is execed by name and the version matters: swayshare relies on
+# --unix-socket, --disable-input, and the enable_auth/private_key_file config
+# keys, all of which need 0.10 or newer. Expressing it here turns a confusing
+# runtime failure into an install-time one.
+depends=(
+  'wayvnc>=0.10.0'
+  'gtk4'
+  'gcc-libs'
+  'glibc'
+)
+makedepends=('cargo' 'pkgconf')
+optdepends=(
+  'wl-clipboard: copy invitations from the tray menu'
+  'sway: the compositor this is built for (any wlroots one will do)'
+)
+
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Regenerate with `updpkgsums` after bumping pkgver. The release workflow
+# prints the correct line in the release notes.
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # Default features include the GTK4 configuration window.
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  # Every test is headless; none of them need a display or a session bus.
+  cargo test --frozen
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm0755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm0644 "packaging/tech.rymcg.swayshare.desktop" \
+    "$pkgdir/usr/share/applications/tech.rymcg.swayshare.desktop"
+}
+
+# ---------------------------------------------------------------------------
+# For a swayshare-cli package - the same binary without the GTK window, which
+# links nothing beyond glibc - change the following and drop the .desktop
+# install above:
+#
+#   pkgname=swayshare-cli
+#   pkgdesc='Temporary, peer-scoped remote desktop access for Sway (no GUI)'
+#   depends=('wayvnc>=0.10.0' 'gcc-libs' 'glibc')
+#   makedepends=('cargo')
+#   provides=('swayshare')
+#   conflicts=('swayshare')
+#
+# and add --no-default-features to the cargo build and test invocations.
+# The tray applet is still included: it needs no GTK.
+# ---------------------------------------------------------------------------

@@ -97,6 +97,23 @@ There are two packages: `swayshare` includes the GTK4 configuration window,
 and `swayshare-cli` is the same binary built without it, for machines that do
 not want GTK.
 
+A statically linked `swayshare-cli` is attached to each
+[release](https://github.com/EnigmaCurry/swayshare/releases) — one file, no
+runtime dependencies of its own, though it still needs `wayvnc` on `PATH`:
+
+```sh
+tar xzf swayshare-cli-*-x86_64-linux-musl.tar.gz
+sudo install -m0755 swayshare-cli-*/swayshare /usr/local/bin/
+```
+
+Or from crates.io, where the GUI needs GTK development headers and the CLI
+does not:
+
+```sh
+cargo install swayshare                        # with the window
+cargo install swayshare --no-default-features  # CLI and tray only
+```
+
 From source — `wayvnc` 0.10 or newer must be on `PATH`:
 
 ```sh
@@ -367,6 +384,51 @@ What it does **not** do:
   a TCP connection. The two differ only under asymmetric routing.
 - Ranges wider than a `/24` are refused outright; a `/24` warns. "One named
   person" is the unit of trust here, and a subnet is not that.
+
+## Packaging
+
+The two build shapes have very different dependency profiles, and that is what
+decides how each is best distributed:
+
+| | CLI + tray (`--no-default-features`) | Full build |
+|---|---|---|
+| Shared libraries | 5 — libc, libm, libgcc_s, vdso, ld.so | 106 |
+| Nix closure | 436 MB | 1008 MB |
+
+The tray and the notifications link nothing beyond libc: `ksni` and
+`notify-rust` speak D-Bus over the socket in pure Rust. So the CLI build
+targets musl cleanly and becomes a single self-contained file, which is what
+the release workflow ships. The GTK build is deliberately *not* published as a
+binary — a dynamically linked GTK application is not portable, and that is
+what distribution packaging is for.
+
+- `packaging/aur/PKGBUILD` builds the full package, with a commented block
+  showing the two-line change for a `swayshare-cli` variant.
+- `.github/workflows/release.yml` runs both feature sets through tests and
+  clippy, builds the static binary, asserts it really has no dynamic
+  dependencies, and publishes it with the source-tarball checksum the AUR
+  package needs.
+
+Whatever route you take, express **wayvnc ≥ 0.10** as a hard dependency.
+swayshare relies on `--unix-socket`, `--disable-input` and the
+`enable_auth`/`private_key_file` config keys; without them the failure is a
+confusing runtime error rather than a refused install.
+
+### Why not AppImage or Flatpak
+
+AppImage would bundle GTK, which is the one genuinely heavy dependency — but
+it cannot bundle the one that matters. wayvnc pulls in libdrm, gbm/mesa and
+ffmpeg/VA-API, and captures through DMA-BUF straight from the compositor, so a
+bundled copy would have to interoperate with the host's kernel DRM and GPU
+driver. That is the classic AppImage failure mode. Leave wayvnc out and the
+image is no longer self-contained: the user installs it from their package
+manager anyway, at which point the AppImage bought nothing. Bundling GTK would
+also make this project responsible for shipping GTK security updates, in a
+tool whose job is handing someone else control of a desktop.
+
+Flatpak is a worse fit still. The design deliberately avoids portals — wayvnc
+needs `wlr-screencopy` and the virtual-keyboard and virtual-pointer protocols
+directly — so it would take enough sandbox holes to defeat the point.
 
 ## Testing
 
