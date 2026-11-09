@@ -226,18 +226,10 @@ everything else, so a session started from the tray or the CLI shows up here
 too, invitation included. Closing the window leaves the tray and any running
 session alone.
 
-### Sway keybindings
+### Sway integration
 
-`swayshare start` launches the daemon itself if it is not already running, so
-it works straight from a binding. A binding for `stop` is worth having: it is
-the fastest way to take the controls back.
-
-```
-bindsym $mod+Shift+s exec swayshare start mike --minutes 30
-bindsym $mod+Shift+x exec swayshare stop
-```
-
-`swayshare status --json` is meant for a status bar:
+Sessions are started from the CLI or the tray applet. `swayshare status --json`
+is meant for a status bar:
 
 ```json
 {"state":"connected","peer":"mike","cidr":"10.0.0.3/32",
