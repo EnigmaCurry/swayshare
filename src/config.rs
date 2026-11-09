@@ -60,6 +60,10 @@ pub struct Security {
     /// Username the remote peer authenticates with.
     #[serde(default = "default_username")]
     pub username: String,
+    /// How many words make up the one-time password the owner reads aloud when
+    /// someone connects. More words is harder to guess but longer to dictate.
+    #[serde(default = "default_password_words")]
+    pub password_words: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +84,9 @@ fn default_session_minutes() -> u64 {
 fn default_username() -> String {
     DEFAULT_USERNAME.to_string()
 }
+fn default_password_words() -> usize {
+    crate::secret::DEFAULT_WORDS
+}
 
 impl Default for Network {
     fn default() -> Self {
@@ -97,6 +104,7 @@ impl Default for Security {
             max_connections: default_max_connections(),
             default_session_minutes: default_session_minutes(),
             username: default_username(),
+            password_words: default_password_words(),
         }
     }
 }
@@ -127,6 +135,9 @@ impl Config {
     fn validate(&self) -> Result<()> {
         if self.security.max_connections == 0 {
             bail!("security.max_connections must be at least 1");
+        }
+        if self.security.password_words < 3 {
+            bail!("security.password_words must be at least 3");
         }
         let mut seen = std::collections::HashSet::new();
         for p in &self.peers {

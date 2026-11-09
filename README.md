@@ -160,15 +160,23 @@ Remote support invitation
 Client:   TigerVNC (or any VeNCrypt-capable client)
 Address:  10.0.0.10:5900
 Username: support
-Password: EXAMPLE0PASSWORD0NOT0REAL0
 TLS cert: SHA256:5C:A1:F9:4B:...
+Password: I will read it to you when you connect
 
 You will have full control of the screen, keyboard and pointer,
-at the same time as me. Connect through the VPN tunnel. The
-password is valid for this session only, and only connections
-from your own address are accepted (10.0.0.3/32).
-Access expires automatically in 30m.
+at the same time as me. Connect through the VPN tunnel. When you
+connect I will read you a one-time password to type in - it is
+different every time. Only connections from your own address are
+accepted (10.0.0.3/32). Access expires automatically in 30m.
 ```
+
+**The password is a one-time secret, spoken not pasted.** There is no stored
+or static password. The moment someone connects, swayshare mints a short word
+passphrase (e.g. `flip-mock-army-zero`) and pops it up on *your* screen
+alongside the connecting address; you read it to the person on the phone and
+they type it in. It is rotated the instant they disconnect, so a secret said
+once can never be reused for a later connection. The word count is
+configurable with `security.password_words` (default 4).
 
 **Client choice matters.** wayvnc wraps the session in VeNCrypt x509 TLS plus
 a password. [TigerVNC](https://tigervnc.org) (`vncviewer`) is the tested,
@@ -355,7 +363,9 @@ your keyboard is a deliberate decision each time, and two remote clients
 fighting over a single pointer is unusable anyway.
 
 Session passwords are never written here. They live only in a 0600 file in
-`$XDG_RUNTIME_DIR/swayshare/`, which is erased when the session ends.
+`$XDG_RUNTIME_DIR/swayshare/`, which is erased when the session ends, and a
+fresh one is minted for each connection. `security.password_words` sets how
+many words it has (default 4, minimum 3).
 
 If neither `interface` nor `address` is set, swayshare refuses to start a
 session rather than falling back to a wildcard bind. The same applies when a
@@ -381,8 +391,15 @@ What swayshare guarantees:
 - **Immediate revocation.** `stop` closes the listener *and* drops connections
   that are already established — it does not wait for the other person to
   disconnect, and it does not ask them.
-- **Fresh credentials per session.** 130 bits of entropy from the system
-  CSPRNG, zeroized in memory on drop and deleted from disk on stop.
+- **A fresh one-time password per connection.** The password is a short word
+  passphrase (default four words from the 1296-word EFF short list, ~41 bits,
+  uniformly drawn from the system CSPRNG) minted when someone connects and
+  shown only to you, to read aloud. It is rotated the instant they disconnect
+  by restarting wayvnc, so a secret spoken once cannot be reused later. It is
+  zeroized in memory on drop and never written outside the 0600 runtime file.
+  Because it is handed over by voice, the popup showing it *is* the
+  confirmation step: nothing reaches the screen until you choose to read it
+  out and the remote types it in.
 - **A stable server identity.** The TLS key pair is generated once and kept,
   so the remote user sees the same fingerprint every time and can pin it. Only
   the password rotates.

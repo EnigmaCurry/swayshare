@@ -747,7 +747,7 @@ mod tests {
                 copy: false,
             },
         );
-        assert!(m.invitation().contains("EXAMPLE"));
+        assert!(m.invitation().contains("10.0.0.10"));
         assert!(message(&m).contains("started elsewhere"), "{}", message(&m));
     }
 
@@ -799,7 +799,7 @@ mod tests {
         reduce(&mut m, Event::SessionStarted(session("mike")));
         let effects = reduce(&mut m, Event::CopyClicked);
         match effects.as_slice() {
-            [Effect::CopyToClipboard(text)] => assert!(text.contains("EXAMPLE")),
+            [Effect::CopyToClipboard(text)] => assert!(text.contains("10.0.0.10")),
             other => panic!("unexpected effects: {other:?}"),
         }
     }

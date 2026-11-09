@@ -44,7 +44,11 @@ struct ActiveSession {
     /// Fixed for the life of the session; see [`AccessMode`].
     mode: AccessMode,
     username: String,
+    /// The current one-time password. Rotated on every disconnect so a secret
+    /// read aloud once cannot be reused for a later connection.
     password: Secret,
+    /// How many words a freshly minted password should have.
+    password_words: usize,
     fingerprint: String,
     /// Fires the cancellation that drops every proxied connection.
     revoker: Revoker,
@@ -65,6 +69,18 @@ struct ActiveSession {
     /// occupant, so the matching "they are gone" notification fires once too.
     announced_auth: bool,
     expires_at: Option<Instant>,
+}
+
+/// Ownership handles for one supervised wayvnc subprocess.
+struct WayvncHandles {
+    /// Send to kill wayvnc now.
+    stop: oneshot::Sender<()>,
+    /// Resolves once the kill completed and the password file was erased.
+    done: oneshot::Receiver<()>,
+    /// Stable path the gate forwards admitted connections to.
+    vnc_socket: PathBuf,
+    /// Stable path the auth monitor queries.
+    control_socket: PathBuf,
 }
 
 /// Internal events folded into the daemon's single event loop.
@@ -268,51 +284,27 @@ impl Daemon {
             self.stop_session("switching to a new peer").await;
         }
 
-        let password = Secret::generate()?;
+        // A fresh one-time password the owner reads aloud when someone
+        // connects; see `rotate_password` for why it is replaced on disconnect.
+        let password = Secret::passphrase(cfg.security.password_words)?;
         let username = cfg.security.username.clone();
 
-        let mut wayvnc = Wayvnc::spawn(
-            &self.runtime_dir,
-            &username,
-            &password,
-            &self.identity,
-            mode,
-        )
-        .await?;
+        let handles = self.spawn_wayvnc(&username, &password, mode).await?;
 
         let listener = match gate::bind(listen).await {
             Ok(l) => l,
             Err(e) => {
                 // No listener means no session; do not leave wayvnc running
                 // with a live password file.
-                wayvnc.shutdown().await;
+                let _ = handles.stop.send(());
+                let _ = tokio::time::timeout(SHUTDOWN_GRACE, handles.done).await;
                 return Err(e);
             }
         };
 
-        let vnc_socket = wayvnc.vnc_socket.clone();
-        let control_socket = wayvnc.control_socket.clone();
+        let vnc_socket = handles.vnc_socket.clone();
+        let control_socket = handles.control_socket.clone();
         let (revoker, cancel) = Revoker::new();
-
-        // The supervisor task owns the child so the event loop can learn about
-        // an unexpected exit without holding a mutable borrow across awaits.
-        let (stop_tx, stop_rx) = oneshot::channel::<()>();
-        let (done_tx, done_rx) = oneshot::channel::<()>();
-        let events = self.events.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                status = wayvnc.wait() => {
-                    let text = match status {
-                        Ok(s) => s.to_string(),
-                        Err(e) => format!("wait failed: {e}"),
-                    };
-                    let _ = events.send(Event::WayvncExited(text)).await;
-                }
-                _ = stop_rx => {}
-            }
-            wayvnc.shutdown().await;
-            let _ = done_tx.send(());
-        });
 
         let (gate_events, mut gate_rx) = mpsc::channel::<GateEvent>(64);
         let forward = self.events.clone();
@@ -360,10 +352,11 @@ impl Daemon {
             mode,
             username,
             password,
+            password_words: cfg.security.password_words,
             fingerprint: self.identity.fingerprint.clone(),
             revoker,
-            wayvnc_stop: Some(stop_tx),
-            wayvnc_done: done_rx,
+            wayvnc_stop: Some(handles.stop),
+            wayvnc_done: handles.done,
             poll: poll_tx,
             connections: 0,
             authenticated: 0,
@@ -410,6 +403,101 @@ impl Daemon {
         notify::session_stopped(reason);
     }
 
+    /// Start wayvnc and the task that supervises it, on the session's fixed
+    /// sockets. Shared by the first start and by every password rotation.
+    ///
+    /// The returned handles own the subprocess's life: send on `stop` to kill
+    /// it, and await `done` to know the kill finished and the password file
+    /// was erased.
+    async fn spawn_wayvnc(
+        &self,
+        username: &str,
+        password: &Secret,
+        mode: AccessMode,
+    ) -> Result<WayvncHandles> {
+        let mut wayvnc =
+            Wayvnc::spawn(&self.runtime_dir, username, password, &self.identity, mode).await?;
+        let vnc_socket = wayvnc.vnc_socket.clone();
+        let control_socket = wayvnc.control_socket.clone();
+
+        // The supervisor task owns the child so the event loop can learn about
+        // an unexpected exit without holding a mutable borrow across awaits.
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                status = wayvnc.wait() => {
+                    let text = match status {
+                        Ok(s) => s.to_string(),
+                        Err(e) => format!("wait failed: {e}"),
+                    };
+                    let _ = events.send(Event::WayvncExited(text)).await;
+                }
+                _ = stop_rx => {}
+            }
+            wayvnc.shutdown().await;
+            let _ = done_tx.send(());
+        });
+
+        Ok(WayvncHandles {
+            stop: stop_tx,
+            done: done_rx,
+            vnc_socket,
+            control_socket,
+        })
+    }
+
+    /// Mint a new one-time password and restart wayvnc with it.
+    ///
+    /// Called after the last client disconnects, while nothing is connected, so
+    /// the brief restart disrupts no one. It is what makes each connection need
+    /// a freshly spoken secret: the password just used is now dead. wayvnc
+    /// comes back on the same sockets, so the gate and auth monitor carry on
+    /// unchanged. A failure here fails closed - the session is torn down.
+    async fn rotate_password(&mut self) {
+        let Some((username, mode, words)) = self
+            .session
+            .as_ref()
+            .map(|s| (s.username.clone(), s.mode, s.password_words))
+        else {
+            return;
+        };
+
+        // Stop the current wayvnc and wait for it to confirm it is gone.
+        if let Some(stop) = self.session.as_mut().and_then(|s| s.wayvnc_stop.take()) {
+            let _ = stop.send(());
+        }
+        if let Some(s) = self.session.as_mut() {
+            let _ = tokio::time::timeout(SHUTDOWN_GRACE, &mut s.wayvnc_done).await;
+        }
+
+        let password = match Secret::passphrase(words) {
+            Ok(p) => p,
+            Err(e) => {
+                self.stop_session(&format!("could not mint a new password: {e}"))
+                    .await;
+                return;
+            }
+        };
+        match self.spawn_wayvnc(&username, &password, mode).await {
+            Ok(handles) => {
+                if let Some(s) = self.session.as_mut() {
+                    s.password = password;
+                    s.wayvnc_stop = Some(handles.stop);
+                    s.wayvnc_done = handles.done;
+                }
+                eprintln!("swayshare: minted a fresh password for the next connection");
+            }
+            Err(e) => {
+                self.stop_session(&format!(
+                    "wayvnc could not restart to rotate the password: {e}"
+                ))
+                .await;
+            }
+        }
+    }
+
     async fn handle_event(&mut self, event: Event) {
         match event {
             Event::Gate(GateEvent::Accepted { ip, active }) => {
@@ -418,13 +506,16 @@ impl Daemon {
                     // A TCP connection, not yet a session: no screen is shared
                     // and no input is injected until the password is accepted.
                     eprintln!("swayshare: {ip} connected, awaiting authentication ({active} open)");
-                    notify::client_connecting(&s.peer.name, &ip.to_string());
+                    // The popup the owner reads down the phone: who is
+                    // connecting, and the one-time password to let them in.
+                    notify::client_connecting(&s.peer.name, &ip.to_string(), s.password.expose());
                     // There is now a connection we have not seen authenticate,
                     // so the monitor has a reason to poll.
                     s.update_polling();
                 }
             }
             Event::Gate(GateEvent::Closed { ip, active }) => {
+                let mut rotate = false;
                 if let Some(s) = &mut self.session {
                     s.connections = active;
                     eprintln!("swayshare: {ip} disconnected ({active} open)");
@@ -436,8 +527,14 @@ impl Daemon {
                             s.announced_auth = false;
                             notify::client_left(&s.peer.name, s.mode);
                         }
+                        // Burn the password they used; the next connection
+                        // gets a fresh one the owner must read anew.
+                        rotate = true;
                     }
                     s.update_polling();
+                }
+                if rotate {
+                    self.rotate_password().await;
                 }
             }
             Event::Auth { authenticated } => {

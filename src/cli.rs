@@ -76,7 +76,11 @@ enum Command {
         json: bool,
     },
     /// Re-print the invitation for the running session
-    Invite,
+    Invite {
+        /// Emit the session as JSON, including the current one-time password
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the supervisor in the foreground
     Daemon,
     /// Run the tray applet (hosts a daemon if none is running)
@@ -123,7 +127,7 @@ async fn dispatch(command: Command) -> Result<()> {
         }
         Command::Stop => simple(Request::Stop, "Access revoked.").await,
         Command::Status { json } => status(json).await,
-        Command::Invite => show_invite().await,
+        Command::Invite { json } => show_invite(json).await,
         Command::Daemon => Daemon::run().await,
         Command::Tray => crate::tray::run().await,
         Command::Gui => run_gui(),
@@ -244,11 +248,17 @@ async fn status(json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn show_invite() -> Result<()> {
+async fn show_invite(json: bool) -> Result<()> {
     let socket = paths::control_socket()?;
     match ipc::expect_ok(ipc::request(&socket, &Request::Invite).await?)? {
         Response::Session(session) => {
-            print!("{}", invite::render(&session));
+            if json {
+                // Carries the live password: the owner can always read their
+                // own secret, and scripts need it to drive a real client.
+                println!("{}", serde_json::to_string(&session)?);
+            } else {
+                print!("{}", invite::render(&session));
+            }
             Ok(())
         }
         other => bail!("unexpected reply from the daemon: {other:?}"),

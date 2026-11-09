@@ -13,8 +13,10 @@ pub fn render(session: &Session) -> String {
     out.push_str("Client:   TigerVNC (or any VeNCrypt-capable client)\n");
     out.push_str(&format!("Address:  {}:{}\n", session.address, session.port));
     out.push_str(&format!("Username: {}\n", session.username));
-    out.push_str(&format!("Password: {}\n", session.password));
     out.push_str(&format!("TLS cert: SHA256:{}\n", session.fingerprint));
+    // The password is deliberately absent: it is a one-time secret minted when
+    // you connect and read aloud, different every time. See the note below.
+    out.push_str("Password: I will read it to you when you connect\n");
     out.push('\n');
     // Say plainly what the recipient is being handed, so they know whether
     // they are driving or watching before they connect.
@@ -29,9 +31,10 @@ pub fn render(session: &Session) -> String {
         }
     }
     out.push('\n');
-    out.push_str("Connect through the VPN tunnel. The password is valid for\n");
-    out.push_str("this session only, and only connections from your own address\n");
-    out.push_str(&format!("are accepted ({}).\n", session.cidr));
+    out.push_str("Connect through the VPN tunnel. When you connect I will read\n");
+    out.push_str("you a one-time password to type in - it is different every\n");
+    out.push_str("time. Only connections from your own address are accepted\n");
+    out.push_str(&format!("({}).\n", session.cidr));
     if let Some(secs) = session.expires_in_seconds {
         out.push_str(&format!(
             "Access expires automatically in {}.\n",
@@ -80,10 +83,21 @@ mod tests {
         let text = render(&session());
         assert!(text.contains("10.0.0.10:5900"));
         assert!(text.contains("support"));
-        assert!(text.contains("ABCDEFGH"));
         assert!(text.contains("SHA256:AA:BB:CC"));
         assert!(text.contains("10.0.0.3/32"));
         assert!(text.contains("expires automatically in 1h"));
+    }
+
+    #[test]
+    fn the_invitation_never_prints_the_live_password() {
+        // The password is a per-connection secret the owner reads aloud; it
+        // must not leak into a pasteable invitation.
+        let text = render(&session());
+        assert!(
+            !text.contains("ABCDEFGH"),
+            "the live password must not appear in the invitation: {text}"
+        );
+        assert!(text.contains("one-time password"));
     }
 
     #[test]

@@ -13,12 +13,20 @@
 use anyhow::{Context, Result};
 use ipnet::IpNet;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::sync::{mpsc, watch};
+
+/// How long to keep trying to reach wayvnc's socket before giving up on one
+/// connection. A password rotation restarts wayvnc, so the socket can be
+/// briefly absent just as a new connection arrives; this rides over that gap
+/// without the connection seeing an error.
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const UPSTREAM_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -256,8 +264,8 @@ async fn forward(
     // coalescing small input events into full segments.
     let _ = client.set_nodelay(true);
 
-    match UnixStream::connect(&vnc_socket).await {
-        Ok(mut upstream) => {
+    match connect_upstream(&vnc_socket, &mut cancel).await {
+        Some(mut upstream) => {
             // No Nagle knob on Unix sockets; the TCP side above is the one
             // that needed it.
             tokio::select! {
@@ -268,12 +276,11 @@ async fn forward(
                 }
             }
         }
-        Err(e) => {
-            let _ = events
-                .send(GateEvent::Failed {
-                    error: format!("connecting to wayvnc socket: {e}"),
-                })
-                .await;
+        None => {
+            // wayvnc never came back (or the session is being revoked). Drop
+            // just this connection rather than failing the whole session: a
+            // genuine wayvnc crash is reported separately by its supervisor.
+            eprintln!("swayshare: dropping {ip}: wayvnc socket was unreachable");
         }
     }
 
@@ -284,6 +291,33 @@ async fn forward(
             active: remaining,
         })
         .await;
+}
+
+/// Connect to wayvnc's socket, retrying briefly across a password rotation.
+///
+/// Returns `None` if the session is being revoked or wayvnc does not reappear
+/// within [`UPSTREAM_CONNECT_TIMEOUT`]; either way this connection is dropped
+/// rather than treated as a session-ending failure.
+async fn connect_upstream(
+    vnc_socket: &Path,
+    cancel: &mut watch::Receiver<bool>,
+) -> Option<UnixStream> {
+    let deadline = tokio::time::Instant::now() + UPSTREAM_CONNECT_TIMEOUT;
+    loop {
+        if *cancel.borrow() {
+            return None;
+        }
+        match UnixStream::connect(vnc_socket).await {
+            Ok(stream) => return Some(stream),
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::select! {
+                    _ = cancel.changed() => return None,
+                    _ = tokio::time::sleep(UPSTREAM_RETRY_INTERVAL) => {}
+                }
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Bind the gate's listener, failing with an actionable message.

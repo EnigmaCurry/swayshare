@@ -50,15 +50,20 @@ pub fn session_started(peer: &str, listen: &str, mode: AccessMode) {
     );
 }
 
-pub fn client_connecting(peer: &str, ip: &str) {
+pub fn client_connecting(peer: &str, ip: &str, password: &str) {
     // A connection has opened but the password has not been checked yet, so
-    // nothing is shared and nothing is injected. Deliberately low-key: this is
-    // also what a port scan or a wrong-password attempt looks like, and the
-    // loud alert is reserved for authentication actually succeeding.
+    // nothing is shared or injected until it is. This is the popup the owner
+    // acts on: it carries the one-time password to read aloud to the person on
+    // the phone. Critical urgency so it stays up long enough to dictate, and
+    // because handing it out is the deliberate decision to grant access.
     send(
-        "Someone is connecting".into(),
-        format!("{peer} connected from {ip} and is authenticating. Nothing is shared yet."),
-        false,
+        format!("{peer} is connecting from {ip}"),
+        format!(
+            "Read this one-time password to let them in:\n\n    {password}\n\n\
+             Only share it with the person you trust. Nothing is on screen \
+             until they enter it."
+        ),
+        true,
     );
 }
 

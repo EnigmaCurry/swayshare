@@ -78,8 +78,14 @@ echo "== start =="
 if ! "$BIN" start tester --minutes 5 > "$SB/invite.txt" 2>&1; then
   echo "could not start a session:"; cat "$SB/invite.txt"; cat "$SB/daemon.log"; exit 1
 fi
-grep -q "Password:" "$SB/invite.txt" && pass "invitation printed with credentials" \
-  || fail "invitation is missing credentials"
+grep -q "one-time password" "$SB/invite.txt" \
+  && pass "invitation explains the one-time spoken password" \
+  || fail "invitation does not mention the one-time password"
+# The live password must never be pasteable from the human invitation.
+REAL_PW=$("$BIN" invite --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
+grep -qF "$REAL_PW" "$SB/invite.txt" \
+  && fail "the live password leaked into the human invitation" \
+  || pass "the human invitation does not contain the live password"
 "$BIN" status | sed 's/^/  /'
 
 echo "== authorised source reaches wayvnc and is challenged for auth =="
@@ -142,7 +148,7 @@ PY
 
 echo "== a real client authenticates and its input reaches the desktop =="
 CA="$XDG_DATA_HOME/swayshare/tls/cert.pem"
-PASSWORD=$(grep '^Password:' "$SB/invite.txt" | awk '{print $2}')
+PASSWORD=$("$BIN" invite --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
 CLIENT="$(dirname "$0")/vnc_client.py"
 rm -f "$SB/KEY_ARRIVED"
 if python3 "$CLIENT" --port "$PORT" --password "$PASSWORD" --ca "$CA" \
@@ -176,7 +182,7 @@ MODE=$("$BIN" status --json | python3 -c 'import json,sys; print(json.load(sys.s
 [ "$MODE" = "view-only" ] && pass "the daemon reports mode=view-only" \
   || fail "expected mode=view-only, got: $MODE"
 
-VIEW_PASSWORD=$(grep '^Password:' "$SB/invite-view.txt" | awk '{print $2}')
+VIEW_PASSWORD=$("$BIN" invite --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
 rm -f "$SB/KEY_ARRIVED"
 if python3 "$CLIENT" --port "$PORT" --password "$VIEW_PASSWORD" --ca "$CA" \
      --send-key 0x61 --repeat 3 --hold 1 > "$SB/client-view.log" 2>&1; then
@@ -235,7 +241,7 @@ CHK
 set_interface "lo"
 "$BIN" start tester --minutes 5 > "$SB/invite-lo.txt" 2>&1 \
   || fail "could not start a session requiring lo"
-LO_PASSWORD=$(grep '^Password:' "$SB/invite-lo.txt" | awk '{print $2}')
+LO_PASSWORD=$("$BIN" invite --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
 if python3 "$CLIENT" --port "$PORT" --password "$LO_PASSWORD" --ca "$CA" \
      --hold 1 > "$SB/client-lo.log" 2>&1; then
   pass "the same peer is admitted once the correct interface is required"

@@ -179,7 +179,7 @@ PY
 
   echo "== authenticate, and the item should demand attention =="
   python3 "$CLIENT" --port "$PORT" \
-    --password "$("$BIN" invite | grep '^Password:' | awk '{print $2}')" \
+    --password "$("$BIN" invite --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')" \
     --ca "$XDG_DATA_HOME/swayshare/tls/cert.pem" --hold 6 >/dev/null 2>&1 &
   VIEWER=$!
   sleep 3
@@ -202,7 +202,7 @@ PY
   sleep 2.5
   ICON_VIEW_WAIT=$(icon_digest)
   python3 "$CLIENT" --port "$PORT" \
-    --password "$("$BIN" invite | grep '^Password:' | awk '{print $2}')" \
+    --password "$("$BIN" invite --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')" \
     --ca "$XDG_DATA_HOME/swayshare/tls/cert.pem" --hold 6 >/dev/null 2>&1 &
   VIEWER2=$!
   sleep 3
