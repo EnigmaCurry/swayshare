@@ -52,6 +52,10 @@ struct ActiveSession {
     wayvnc_stop: Option<oneshot::Sender<()>>,
     /// Resolves once wayvnc is confirmed dead and its config file erased.
     wayvnc_done: oneshot::Receiver<()>,
+    /// Tells the auth monitor whether it is worth polling wayvnc right now.
+    /// Only true while a connected client has not yet authenticated, so an
+    /// idle or fully-authenticated session makes no control-socket traffic.
+    poll: watch::Sender<bool>,
     connections: usize,
     /// How many connected clients have passed authentication. Distinct from
     /// `connections`, which counts bare TCP connections the moment they are
@@ -337,8 +341,15 @@ impl Daemon {
         // Watch wayvnc for authentication. The gate can only see TCP connects;
         // whether a connected peer has actually passed the password lives in
         // wayvnc, which has no event for it - hence the poll. Shares the
-        // session's cancellation, so it stops the instant access is revoked.
-        tokio::spawn(monitor_auth(control_socket, self.events.clone(), cancel));
+        // session's cancellation, so it stops the instant access is revoked,
+        // and only polls while `poll_rx` says there is something to learn.
+        let (poll_tx, poll_rx) = watch::channel(false);
+        tokio::spawn(monitor_auth(
+            control_socket,
+            self.events.clone(),
+            cancel,
+            poll_rx,
+        ));
 
         let minutes = minutes.unwrap_or(cfg.security.default_session_minutes);
         let expires_at = (minutes > 0).then(|| Instant::now() + Duration::from_secs(minutes * 60));
@@ -353,6 +364,7 @@ impl Daemon {
             revoker,
             wayvnc_stop: Some(stop_tx),
             wayvnc_done: done_rx,
+            poll: poll_tx,
             connections: 0,
             authenticated: 0,
             announced_auth: false,
@@ -407,6 +419,9 @@ impl Daemon {
                     // and no input is injected until the password is accepted.
                     eprintln!("swayshare: {ip} connected, awaiting authentication ({active} open)");
                     notify::client_connecting(&s.peer.name, &ip.to_string());
+                    // There is now a connection we have not seen authenticate,
+                    // so the monitor has a reason to poll.
+                    s.update_polling();
                 }
             }
             Event::Gate(GateEvent::Closed { ip, active }) => {
@@ -422,11 +437,15 @@ impl Daemon {
                             notify::client_left(&s.peer.name, s.mode);
                         }
                     }
+                    s.update_polling();
                 }
             }
             Event::Auth { authenticated } => {
                 if let Some(s) = &mut self.session {
                     s.authenticated = authenticated;
+                    // Once every connection has authenticated there is nothing
+                    // left to watch for, so the monitor can go quiet again.
+                    s.update_polling();
                     if authenticated > 0 && !s.announced_auth {
                         // The rising edge: someone is now actually in. This is
                         // the alert that matters, and the only one that names
@@ -471,6 +490,23 @@ impl ActiveSession {
         Some(at.saturating_duration_since(Instant::now()).as_secs())
     }
 
+    /// Enable the auth monitor only while a connection has yet to authenticate.
+    ///
+    /// With nobody connected, or everyone connected already authenticated,
+    /// there is nothing to learn from wayvnc, so the monitor should not keep
+    /// hammering the control socket (which logs every query).
+    fn update_polling(&self) {
+        let needed = self.connections > self.authenticated;
+        self.poll.send_if_modified(|cur| {
+            if *cur != needed {
+                *cur = needed;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
     fn describe(&self) -> Session {
         Session {
             peer: self.peer.name.clone(),
@@ -490,32 +526,61 @@ impl ActiveSession {
 ///
 /// Authentication is the one piece of session state wayvnc exposes only on
 /// request, not as an event, so it is discovered by asking `client-list` on a
-/// timer. Only changes are forwarded, to keep the daemon's log and
-/// notifications quiet. A failed query is swallowed and retried: a transient
-/// hiccup talking to the control socket must not be mistaken for "nobody is
-/// authenticated", which would wrongly clear the on-screen warning.
+/// timer. To avoid spamming wayvnc's control socket (and its log), the daemon
+/// gates polling through `poll`: it is only on while a connection has yet to
+/// authenticate, so a granted-but-empty or fully-authenticated session is
+/// silent. Only changes are forwarded. A failed query is swallowed and
+/// retried: a transient hiccup talking to the control socket must not be
+/// mistaken for "nobody is authenticated", which would wrongly clear the
+/// on-screen warning.
 async fn monitor_auth(
     control_socket: PathBuf,
     events: mpsc::Sender<Event>,
     mut cancel: watch::Receiver<bool>,
+    mut poll: watch::Receiver<bool>,
 ) {
     let mut last: Option<usize> = None;
-    let mut tick = tokio::time::interval(AUTH_POLL_INTERVAL);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
-            biased;
-            _ = cancel.changed() => break,
-            _ = tick.tick() => {
-                match crate::wayvnc::authenticated_clients(&control_socket).await {
-                    Ok(n) if last != Some(n) => {
-                        last = Some(n);
-                        if events.send(Event::Auth { authenticated: n }).await.is_err() {
-                            break;
-                        }
+        // Idle until the daemon says a connection is waiting to authenticate.
+        while !*poll.borrow_and_update() {
+            tokio::select! {
+                biased;
+                _ = cancel.changed() => return,
+                changed = poll.changed() => {
+                    if changed.is_err() {
+                        return;
                     }
-                    Ok(_) => {}
-                    Err(_) => {}
+                }
+            }
+        }
+
+        // A fresh interval fires its first tick immediately, so a connection is
+        // checked promptly rather than up to one period later.
+        let mut tick = tokio::time::interval(AUTH_POLL_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.changed() => return,
+                changed = poll.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    if !*poll.borrow_and_update() {
+                        break; // nothing left to watch; go back to idle
+                    }
+                }
+                _ = tick.tick() => {
+                    match crate::wayvnc::authenticated_clients(&control_socket).await {
+                        Ok(n) if last != Some(n) => {
+                            last = Some(n);
+                            if events.send(Event::Auth { authenticated: n }).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => {}
+                    }
                 }
             }
         }
