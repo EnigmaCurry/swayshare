@@ -189,6 +189,63 @@ sleep 1.5
   && fail "a view-only session delivered a key press to the compositor" \
   || pass "the key press was dropped - view-only really is view-only"
 
+echo "== the interface requirement confines access beyond the CIDR =="
+set_interface() {
+  python3 - "$XDG_CONFIG_HOME/swayshare/config.toml" "$1" <<'CFG'
+import re, sys
+path, iface = sys.argv[1], sys.argv[2]
+text = open(path).read()
+text = re.sub(r'^interface = .*\n', '', text, flags=re.M)
+if iface:
+    text = text.replace("[network]\n", f'[network]\ninterface = "{iface}"\n', 1)
+open(path, "w").write(text)
+CFG
+}
+
+# Require an interface the loopback peer cannot possibly arrive on. The CIDR
+# still matches, so anything that gets through did so on the address alone.
+"$BIN" stop >/dev/null 2>&1
+set_interface "swayshare-no-such-iface"
+"$BIN" start tester --minutes 5 >/dev/null 2>&1 \
+  || fail "could not start a session with an interface requirement"
+python3 - "$PORT" <<'CHK'
+import socket, sys
+port = int(sys.argv[1])
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+s.settimeout(5)
+try:
+    data = s.recv(12)
+    if data == b"":
+        print("  PASS: refused despite the CIDR matching")
+    else:
+        print(f"  FAIL: leaked {data!r} - the interface rule did not hold"); sys.exit(1)
+except ConnectionResetError:
+    print("  PASS: reset despite the CIDR matching")
+except socket.timeout:
+    print("  FAIL: hung open instead of being refused"); sys.exit(1)
+finally:
+    s.close()
+CHK
+[ $? -eq 0 ] || FAILURES=$((FAILURES + 1))
+
+# Now name the interface the peer really does arrive on; the same CIDR and the
+# same client must be let through, proving the refusal above came from the
+# interface rule and nothing else.
+"$BIN" stop >/dev/null 2>&1
+set_interface "lo"
+"$BIN" start tester --minutes 5 > "$SB/invite-lo.txt" 2>&1 \
+  || fail "could not start a session requiring lo"
+LO_PASSWORD=$(grep '^Password:' "$SB/invite-lo.txt" | awk '{print $2}')
+if python3 "$CLIENT" --port "$PORT" --password "$LO_PASSWORD" --ca "$CA" \
+     --hold 1 > "$SB/client-lo.log" 2>&1; then
+  pass "the same peer is admitted once the correct interface is required"
+else
+  fail "requiring the real interface broke a legitimate session: $(tail -2 "$SB/client-lo.log")"
+fi
+
+# Leave the config as the later checks expect it.
+set_interface ""
+
 echo "== stop revokes immediately =="
 "$BIN" stop >/dev/null
 sleep 0.3

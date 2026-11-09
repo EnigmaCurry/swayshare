@@ -10,7 +10,7 @@ use ipnet::IpNet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use swayshare::gate::{self, GateEvent, Revoker};
+use swayshare::gate::{self, GateEvent, Policy, Revoker};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UnixListener};
 use tokio::sync::mpsc;
@@ -68,6 +68,16 @@ impl Drop for TempDir {
 
 /// Start a gate on loopback that admits `allow` and permits `max` connections.
 async fn harness(tag: &str, allow: &str, max: usize) -> Harness {
+    harness_with(tag, allow, max, None).await
+}
+
+/// Start a gate on loopback, optionally requiring a named interface.
+async fn harness_with(
+    tag: &str,
+    allow: &str,
+    max: usize,
+    required_interface: Option<&str>,
+) -> Harness {
     let dir = TempDir::new(tag);
     let socket = dir.0.join("vnc.sock");
     spawn_echo_server(&socket).await;
@@ -80,9 +90,13 @@ async fn harness(tag: &str, allow: &str, max: usize) -> Harness {
 
     let (tx, rx) = mpsc::channel(32);
     let (revoker, cancel) = Revoker::new();
-    let allow: IpNet = allow.parse().unwrap();
+    let policy = Policy {
+        allow: allow.parse::<IpNet>().unwrap(),
+        required_interface: required_interface.map(str::to_string),
+        max_connections: max,
+    };
 
-    tokio::spawn(gate::serve(listener, allow, socket, max, tx, cancel));
+    tokio::spawn(gate::serve(listener, policy, socket, tx, cancel));
 
     Harness {
         listen,
@@ -255,4 +269,77 @@ async fn a_slot_is_released_when_a_viewer_leaves() {
         b"two",
         "the freed slot should admit the next viewer"
     );
+}
+
+#[tokio::test]
+async fn a_connection_over_the_required_interface_is_admitted() {
+    // Loopback traffic really does route over "lo", so this exercises the
+    // kernel route lookup rather than a stubbed one.
+    let mut h = harness_with("iface-ok", "127.0.0.1/32", 1, Some("lo")).await;
+    let mut client = connect_from(Ipv4Addr::LOCALHOST, h.listen).await;
+
+    client.write_all(b"hello").await.unwrap();
+    assert_eq!(
+        read_with_timeout(&mut client).await.unwrap(),
+        b"hello",
+        "a peer on the required interface should be forwarded normally"
+    );
+    match h.events.recv().await.unwrap() {
+        GateEvent::Accepted { .. } => {}
+        other => panic!("expected Accepted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_authorised_address_on_the_wrong_interface_is_refused() {
+    // This is the whole point of the rule: the CIDR matches, and the
+    // connection is still refused because it did not arrive over wg0.
+    let mut h = harness_with(
+        "iface-wrong",
+        "127.0.0.1/32",
+        1,
+        Some("wg-not-a-real-iface"),
+    )
+    .await;
+    let mut client = connect_from(Ipv4Addr::LOCALHOST, h.listen).await;
+
+    client.write_all(b"hello").await.ok();
+    assert!(
+        read_with_timeout(&mut client).await.is_none(),
+        "an address-authorised peer on the wrong interface must get no bytes"
+    );
+    match h.events.recv().await.unwrap() {
+        GateEvent::Rejected { decision, .. } => {
+            assert_eq!(decision, gate::Decision::DenyInterface);
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_over_broad_cidr_is_contained_by_the_interface_rule() {
+    // The failure this rule exists to survive: the CIDR is wide open, so the
+    // address check alone would admit anything. The interface check must still
+    // hold the line.
+    let mut h = harness_with("iface-broad", "0.0.0.0/0", 1, Some("wg-not-a-real-iface")).await;
+    let mut client = connect_from(Ipv4Addr::LOCALHOST, h.listen).await;
+
+    client.write_all(b"hello").await.ok();
+    assert!(
+        read_with_timeout(&mut client).await.is_none(),
+        "a wide-open CIDR must not be enough to get through on its own"
+    );
+    match h.events.recv().await.unwrap() {
+        GateEvent::Rejected { decision, .. } => {
+            assert_eq!(decision, gate::Decision::DenyInterface);
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+
+    // ...and with the correct interface the same wide CIDR does let it in,
+    // proving the refusal above came from the interface rule and nothing else.
+    let ok = harness_with("iface-broad-ok", "0.0.0.0/0", 1, Some("lo")).await;
+    let mut client = connect_from(Ipv4Addr::LOCALHOST, ok.listen).await;
+    client.write_all(b"hello").await.unwrap();
+    assert_eq!(read_with_timeout(&mut client).await.unwrap(), b"hello");
 }

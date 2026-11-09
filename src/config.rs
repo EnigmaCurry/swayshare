@@ -23,11 +23,27 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Network {
-    /// Interface whose address the gate binds to, e.g. `wg0`. Resolved at
-    /// session start so a tunnel that comes and goes is picked up each time.
+    /// The interface access is confined to, e.g. `wg0`.
+    ///
+    /// This does two things. Its current address is what the gate binds to,
+    /// resolved at every session start so a tunnel that comes and goes is
+    /// picked up each time; and every connection must reach us over it, or it
+    /// is refused whatever the peer's CIDR says.
+    ///
+    /// The second part is the one that matters. Binding an interface's
+    /// *address* does not confine traffic to that interface: Linux uses the
+    /// weak host model, so a packet addressed to the wg0 address is accepted
+    /// arriving on any interface. Without the route check, a mistyped CIDR
+    /// would be the only thing between the internet and wayvnc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<String>,
-    /// Explicit bind address. Takes precedence over `interface`.
+    /// Explicit bind address, which takes precedence over `interface` for
+    /// *binding* only.
+    ///
+    /// Setting both is meaningful: the gate binds `address` but still refuses
+    /// anything that does not arrive over `interface`. Setting `address`
+    /// alone turns the interface requirement off, which is weaker - the CIDR
+    /// then stands alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<IpAddr>,
     #[serde(default = "default_port")]
@@ -328,6 +344,28 @@ mod tests {
         assert_eq!(
             resolve_listen_ip(&net).unwrap(),
             "10.0.0.10".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn address_and_interface_have_separate_jobs() {
+        // `address` decides where to bind; `interface` decides what is let
+        // in. Setting both is a legitimate combination - bind somewhere
+        // specific, but still only accept traffic off the tunnel.
+        let net = Network {
+            interface: Some("wg0".into()),
+            address: Some("0.0.0.0".parse().unwrap()),
+            port: 5900,
+        };
+        assert_eq!(
+            resolve_listen_ip(&net).unwrap(),
+            "0.0.0.0".parse::<IpAddr>().unwrap(),
+            "the explicit address wins for binding"
+        );
+        assert_eq!(
+            net.interface.as_deref(),
+            Some("wg0"),
+            "...and the interface requirement is still there to be enforced"
         );
     }
 

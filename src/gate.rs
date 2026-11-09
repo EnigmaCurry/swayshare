@@ -2,15 +2,17 @@
 //!
 //! wayvnc listens on a Unix socket inside the private runtime directory and
 //! has no network listener of its own. Everything that reaches it comes
-//! through [`serve`], which admits a connection only when its source address
-//! falls inside the authorised peer's CIDR and the connection limit allows it.
+//! through [`serve`], which admits a connection only when it satisfies every
+//! part of the [`Policy`]: the source address is inside the authorised peer's
+//! CIDR, it reaches us over the required network interface, and the
+//! connection limit allows it.
 //!
 //! The admission decision is factored into the pure [`decide`] function so it
 //! can be exercised directly by tests.
 
 use anyhow::{Context, Result};
 use ipnet::IpNet;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,8 +25,41 @@ pub enum Decision {
     Allow,
     /// Source address is outside the authorised peer's range.
     DenyAddress,
+    /// The peer does not reach us over the required interface.
+    DenyInterface,
     /// Address is authorised but the connection limit is already reached.
     DenyLimit,
+}
+
+impl Decision {
+    /// Short phrase for logs and notifications.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Decision::Allow => "allowed",
+            Decision::DenyAddress => "address not authorised",
+            Decision::DenyInterface => "not reachable over the required interface",
+            Decision::DenyLimit => "connection limit reached",
+        }
+    }
+}
+
+/// Everything the gate checks a connection against.
+///
+/// Held together in one place so that adding a rule cannot accidentally
+/// bypass the others.
+#[derive(Debug, Clone)]
+pub struct Policy {
+    /// The authorised peer's address range.
+    pub allow: IpNet,
+    /// When set, a connection is admitted only if its source address routes
+    /// back through this interface.
+    ///
+    /// This exists because binding to an interface's *address* is weaker than
+    /// it looks: Linux uses the weak host model, so a packet addressed to the
+    /// wg0 address is accepted on any interface. Without this check a
+    /// mistyped CIDR would be the only thing between the internet and wayvnc.
+    pub required_interface: Option<String>,
+    pub max_connections: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -64,14 +99,53 @@ pub fn normalize(ip: IpAddr) -> IpAddr {
 }
 
 /// Decide whether to admit a connection. Pure, so it is directly testable.
-pub fn decide(peer: IpAddr, allow: &IpNet, active: usize, max: usize) -> Decision {
-    if !allow.contains(&normalize(peer)) {
+///
+/// `route` is the interface the peer's address currently routes through, as
+/// determined by [`egress_interface`]; `None` means the kernel could not say.
+pub fn decide(policy: &Policy, peer: IpAddr, route: Option<&str>, active: usize) -> Decision {
+    if !policy.allow.contains(&normalize(peer)) {
         return Decision::DenyAddress;
     }
-    if active >= max {
+    if let Some(required) = policy.required_interface.as_deref() {
+        // An unknown route is a denial, not a pass: if we cannot show the
+        // peer is on the right interface, we must assume it is not.
+        if route != Some(required) {
+            return Decision::DenyInterface;
+        }
+    }
+    if active >= policy.max_connections {
         return Decision::DenyLimit;
     }
     Decision::Allow
+}
+
+/// Name the interface that traffic to `peer` would leave by.
+///
+/// Connecting a UDP socket sends nothing; it just asks the kernel to run its
+/// routing decision and pin the result, which `getsockname` then reveals as
+/// the source address it chose. Mapping that address back to an interface
+/// gives us the kernel's own answer - including any policy routing - without
+/// parsing routing tables and, crucially, without privileges. `SO_BINDTODEVICE`
+/// would be more direct but needs `CAP_NET_RAW`, which this program does not
+/// want to hold.
+///
+/// Returns `None` when the address is unroutable or the local address does not
+/// belong to any interface we can see; callers must treat that as a denial.
+pub fn egress_interface(peer: IpAddr) -> Option<String> {
+    let bind: SocketAddr = match peer {
+        IpAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+        IpAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let socket = UdpSocket::bind(bind).ok()?;
+    // Port 9 is discard; nothing is ever sent, so it only has to be non-zero.
+    socket.connect(SocketAddr::new(peer, 9)).ok()?;
+    let local = socket.local_addr().ok()?.ip();
+
+    let addrs = if_addrs::get_if_addrs().ok()?;
+    addrs
+        .into_iter()
+        .find(|i| i.addr.ip() == local)
+        .map(|i| i.name)
 }
 
 /// Shared handle used to revoke a running gate.
@@ -98,9 +172,8 @@ impl Revoker {
 /// window in which a revoked session still has a bound port.
 pub async fn serve(
     listener: TcpListener,
-    allow: IpNet,
+    policy: Policy,
     vnc_socket: PathBuf,
-    max_connections: usize,
     events: mpsc::Sender<GateEvent>,
     mut cancel: watch::Receiver<bool>,
 ) {
@@ -129,7 +202,13 @@ pub async fn serve(
 
         let ip = normalize(addr.ip());
         let current = active.load(Ordering::SeqCst);
-        match decide(ip, &allow, current, max_connections) {
+        // Recomputed per connection rather than cached: a tunnel can come up
+        // or go down mid-session, and a stale answer would be the wrong one.
+        let route = policy
+            .required_interface
+            .as_ref()
+            .and_then(|_| egress_interface(ip));
+        match decide(&policy, ip, route.as_deref(), current) {
             Decision::Allow => {}
             decision => {
                 // Drop the socket without writing anything back: an
@@ -224,40 +303,45 @@ mod tests {
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
-    fn net(s: &str) -> IpNet {
-        s.parse().unwrap()
+
+    fn policy(allow: &str) -> Policy {
+        Policy {
+            allow: allow.parse().unwrap(),
+            required_interface: None,
+            max_connections: 1,
+        }
+    }
+
+    fn policy_on(allow: &str, interface: &str) -> Policy {
+        Policy {
+            required_interface: Some(interface.to_string()),
+            ..policy(allow)
+        }
     }
 
     #[test]
     fn authorised_host_is_admitted() {
         assert_eq!(
-            decide(ip("10.0.0.3"), &net("10.0.0.3/32"), 0, 1),
+            decide(&policy("10.0.0.3/32"), ip("10.0.0.3"), None, 0),
             Decision::Allow
         );
     }
 
     #[test]
     fn neighbouring_host_is_refused() {
-        assert_eq!(
-            decide(ip("10.0.0.4"), &net("10.0.0.3/32"), 0, 1),
-            Decision::DenyAddress
-        );
-        assert_eq!(
-            decide(ip("10.0.1.3"), &net("10.0.0.3/32"), 0, 1),
-            Decision::DenyAddress
-        );
+        let p = policy("10.0.0.3/32");
+        assert_eq!(decide(&p, ip("10.0.0.4"), None, 0), Decision::DenyAddress);
+        assert_eq!(decide(&p, ip("10.0.1.3"), None, 0), Decision::DenyAddress);
     }
 
     #[test]
     fn ipv4_mapped_source_matches_ipv4_rule() {
         // What a dual-stack listener actually reports for an IPv4 client.
         assert_eq!(normalize(ip("::ffff:10.0.0.3")), ip("10.0.0.3"));
+        let p = policy("10.0.0.3/32");
+        assert_eq!(decide(&p, ip("::ffff:10.0.0.3"), None, 0), Decision::Allow);
         assert_eq!(
-            decide(ip("::ffff:10.0.0.3"), &net("10.0.0.3/32"), 0, 1),
-            Decision::Allow
-        );
-        assert_eq!(
-            decide(ip("::ffff:10.0.0.4"), &net("10.0.0.3/32"), 0, 1),
+            decide(&p, ip("::ffff:10.0.0.4"), None, 0),
             Decision::DenyAddress
         );
     }
@@ -266,51 +350,138 @@ mod tests {
     fn mapped_form_does_not_leak_across_families() {
         // An IPv6 rule must not be satisfied by an IPv4 client arriving mapped.
         assert_eq!(
-            decide(ip("::ffff:10.0.0.3"), &net("::/0"), 0, 1),
+            decide(&policy("::/0"), ip("::ffff:10.0.0.3"), None, 0),
             Decision::DenyAddress
         );
         // ...and a real IPv6 address is still matched normally.
-        assert_eq!(
-            decide(ip("fd00::3"), &net("fd00::3/128"), 0, 1),
-            Decision::Allow
-        );
-        assert_eq!(
-            decide(ip("fd00::4"), &net("fd00::3/128"), 0, 1),
-            Decision::DenyAddress
-        );
+        let p = policy("fd00::3/128");
+        assert_eq!(decide(&p, ip("fd00::3"), None, 0), Decision::Allow);
+        assert_eq!(decide(&p, ip("fd00::4"), None, 0), Decision::DenyAddress);
     }
 
     #[test]
     fn subnet_rules_match_their_members_only() {
-        let n = net("10.0.0.0/24");
-        assert_eq!(decide(ip("10.0.0.1"), &n, 0, 1), Decision::Allow);
-        assert_eq!(decide(ip("10.0.0.255"), &n, 0, 1), Decision::Allow);
-        assert_eq!(decide(ip("10.0.1.0"), &n, 0, 1), Decision::DenyAddress);
+        let p = policy("10.0.0.0/24");
+        assert_eq!(decide(&p, ip("10.0.0.1"), None, 0), Decision::Allow);
+        assert_eq!(decide(&p, ip("10.0.0.255"), None, 0), Decision::Allow);
+        assert_eq!(decide(&p, ip("10.0.1.0"), None, 0), Decision::DenyAddress);
     }
 
     #[test]
     fn connection_limit_is_enforced_after_the_address_check() {
+        let p = policy("10.0.0.3/32");
         // At the limit, an authorised peer is refused...
-        assert_eq!(
-            decide(ip("10.0.0.3"), &net("10.0.0.3/32"), 1, 1),
-            Decision::DenyLimit
-        );
+        assert_eq!(decide(&p, ip("10.0.0.3"), None, 1), Decision::DenyLimit);
         // ...and an unauthorised one is refused for the stronger reason.
-        assert_eq!(
-            decide(ip("10.0.0.9"), &net("10.0.0.3/32"), 1, 1),
-            Decision::DenyAddress
-        );
-        assert_eq!(
-            decide(ip("10.0.0.3"), &net("10.0.0.3/32"), 1, 2),
-            Decision::Allow
-        );
+        assert_eq!(decide(&p, ip("10.0.0.9"), None, 1), Decision::DenyAddress);
+        let roomy = Policy {
+            max_connections: 2,
+            ..p
+        };
+        assert_eq!(decide(&roomy, ip("10.0.0.3"), None, 1), Decision::Allow);
     }
 
     #[test]
     fn loopback_is_not_implicitly_trusted() {
         assert_eq!(
-            decide(ip("127.0.0.1"), &net("10.0.0.3/32"), 0, 1),
+            decide(&policy("10.0.0.3/32"), ip("127.0.0.1"), None, 0),
             Decision::DenyAddress
         );
+    }
+
+    // --- the interface requirement ---
+
+    #[test]
+    fn no_required_interface_means_the_route_is_ignored() {
+        let p = policy("10.0.0.3/32");
+        for route in [None, Some("eth0"), Some("wg0")] {
+            assert_eq!(decide(&p, ip("10.0.0.3"), route, 0), Decision::Allow);
+        }
+    }
+
+    #[test]
+    fn the_right_interface_is_admitted_and_others_are_not() {
+        let p = policy_on("10.0.0.3/32", "wg0");
+        assert_eq!(decide(&p, ip("10.0.0.3"), Some("wg0"), 0), Decision::Allow);
+        assert_eq!(
+            decide(&p, ip("10.0.0.3"), Some("eth0"), 0),
+            Decision::DenyInterface
+        );
+    }
+
+    #[test]
+    fn an_unknown_route_is_a_denial_not_a_pass() {
+        // The whole point is to fail closed: if the kernel cannot tell us the
+        // peer is on wg0, we must not assume it is.
+        let p = policy_on("10.0.0.3/32", "wg0");
+        assert_eq!(decide(&p, ip("10.0.0.3"), None, 0), Decision::DenyInterface);
+    }
+
+    #[test]
+    fn the_interface_check_catches_an_over_broad_cidr() {
+        // The reason this rule exists. A far-too-wide CIDR would admit this
+        // address on its own; arriving over the wrong interface still does not.
+        let p = policy_on("10.0.0.0/8", "wg0");
+        assert_eq!(
+            decide(&p, ip("10.1.2.3"), Some("eth0"), 0),
+            Decision::DenyInterface
+        );
+        assert_eq!(decide(&p, ip("10.1.2.3"), Some("wg0"), 0), Decision::Allow);
+    }
+
+    #[test]
+    fn interface_names_are_matched_exactly() {
+        let p = policy_on("10.0.0.3/32", "wg0");
+        for near_miss in ["wg", "wg00", "wg0:1", "WG0", " wg0"] {
+            assert_eq!(
+                decide(&p, ip("10.0.0.3"), Some(near_miss), 0),
+                Decision::DenyInterface,
+                "{near_miss:?} must not pass for wg0"
+            );
+        }
+    }
+
+    #[test]
+    fn the_address_rule_still_wins_over_the_interface_rule() {
+        // Right interface, wrong address: still refused, and reported as the
+        // address failure because that is the more fundamental one.
+        let p = policy_on("10.0.0.3/32", "wg0");
+        assert_eq!(
+            decide(&p, ip("10.0.0.9"), Some("wg0"), 0),
+            Decision::DenyAddress
+        );
+    }
+
+    #[test]
+    fn every_denial_has_a_distinct_reason() {
+        use std::collections::HashSet;
+        let reasons: HashSet<&str> = [
+            Decision::DenyAddress,
+            Decision::DenyInterface,
+            Decision::DenyLimit,
+        ]
+        .into_iter()
+        .map(Decision::reason)
+        .collect();
+        assert_eq!(reasons.len(), 3, "the user should be told which rule bit");
+    }
+
+    // --- the kernel route lookup ---
+
+    #[test]
+    fn loopback_routes_over_the_loopback_interface() {
+        // A real routing decision, which is portable enough to assert on:
+        // 127.0.0.1 always leaves by the loopback device.
+        assert_eq!(egress_interface(ip("127.0.0.1")).as_deref(), Some("lo"));
+        assert_eq!(egress_interface(ip("::1")).as_deref(), Some("lo"));
+    }
+
+    #[test]
+    fn a_non_loopback_address_does_not_route_over_loopback() {
+        // Whatever the host's routing looks like, a public address must not
+        // come back as "lo" - otherwise the check would be trivially passed.
+        if let Some(name) = egress_interface(ip("198.51.100.1")) {
+            assert_ne!(name, "lo");
+        }
     }
 }

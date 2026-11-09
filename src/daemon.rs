@@ -6,7 +6,7 @@
 //! credentials, so the failure mode is always "no access".
 
 use crate::config::{self, Config, Peer};
-use crate::gate::{self, Decision, GateEvent, Revoker};
+use crate::gate::{self, GateEvent, Policy, Revoker};
 use crate::identity::Identity;
 use crate::invite;
 use crate::ipc::{AccessMode, Request, Response, Session, State, Status};
@@ -280,9 +280,14 @@ impl Daemon {
 
         tokio::spawn(gate::serve(
             listener,
-            peer.cidr,
+            Policy {
+                allow: peer.cidr,
+                // Binding to the interface's address is not enough on its own;
+                // see `Policy::required_interface`.
+                required_interface: cfg.network.interface.clone(),
+                max_connections: cfg.security.max_connections,
+            },
             vnc_socket,
-            cfg.security.max_connections,
             gate_events,
             cancel,
         ));
@@ -363,11 +368,10 @@ impl Daemon {
                 }
             }
             Event::Gate(GateEvent::Rejected { ip, decision }) => {
-                let reason = match decision {
-                    Decision::DenyAddress => "address not authorised",
-                    Decision::DenyLimit => "connection limit reached",
-                    Decision::Allow => return,
-                };
+                if decision == gate::Decision::Allow {
+                    return;
+                }
+                let reason = decision.reason();
                 eprintln!("swayshare: refused {ip} ({reason})");
                 notify::rejected(&ip.to_string(), reason);
             }
