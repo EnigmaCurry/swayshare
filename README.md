@@ -196,6 +196,10 @@ something. Send them the certificate — it is public, and
 swayshare cert > swayshare.pem    # send this file to your helper
 ```
 
+In the configuration window it is a drag handle next to **Copy invitation** —
+drag `swayshare.pem` straight into your chat client and send it, without
+going looking for the file.
+
 The fingerprint in the invitation is what makes that safe to send over any
 channel: they compare it against the file before trusting it.
 

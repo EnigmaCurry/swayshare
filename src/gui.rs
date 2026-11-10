@@ -19,11 +19,13 @@
 //! would otherwise freeze the UI.
 
 use crate::config::Config;
+use crate::identity::Identity;
 use crate::ipc::{self, Request, Response};
 use crate::paths;
 use crate::window::{self, Effect, Event, Model};
 use anyhow::Result;
 use gtk::prelude::*;
+use gtk::{gdk, gio};
 use gtk4 as gtk;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -48,6 +50,9 @@ struct Widgets {
     add_button: gtk::Button,
     remove_button: gtk::Button,
     invitation: gtk::TextView,
+    /// The handle the certificate is dragged out of. See [`wire`] for why
+    /// this is a drag source rather than a button.
+    cert_drag: gtk::Box,
 }
 
 struct Ui {
@@ -115,6 +120,19 @@ fn build_window(app: &gtk::Application) {
         copy_button: gtk::Button::with_label("Copy invitation"),
         add_button: gtk::Button::with_label("Add"),
         remove_button: gtk::Button::with_label("Remove selected peer"),
+        cert_drag: {
+            let row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
+                .margin_top(4)
+                .margin_bottom(4)
+                .margin_start(8)
+                .margin_end(8)
+                .build();
+            row.append(&gtk::Image::from_icon_name("application-certificate"));
+            row.append(&gtk::Label::builder().label("swayshare.pem").build());
+            row
+        },
         invitation: gtk::TextView::builder()
             .editable(false)
             .monospace(true)
@@ -126,6 +144,12 @@ fn build_window(app: &gtk::Application) {
             .build(),
     };
     widgets.enable_button.add_css_class("suggested-action");
+    widgets.cert_drag.set_tooltip_text(Some(
+        "The certificate your helper needs. Drag it into your chat and send it.\n\
+             Enable access first, so it covers the address you are sharing from.",
+    ));
+    // The only hint that this is picked up rather than clicked.
+    widgets.cert_drag.set_cursor_from_name(Some("grab"));
     widgets.stop_button.add_css_class("destructive-action");
     widgets
         .minutes
@@ -448,6 +472,40 @@ fn wire(ui: &Rc<Ui>) {
         Event::ViewOnlyToggled(ui.widgets.view_only.is_active())
     });
 
+    // The certificate is the one thing a helper needs that is not in the
+    // invitation text, and it lives somewhere nobody should have to go
+    // looking for. So it is draggable: pick it up here, drop it in a chat.
+    {
+        let drag = gtk::DragSource::new();
+        drag.set_actions(gdk::DragAction::COPY);
+        // Drag a snapshot of the handle itself, so what the pointer carries
+        // is recognisably the thing that was picked up.
+        drag.set_icon(
+            Some(&gtk::WidgetPaintable::new(Some(&ui.widgets.cert_drag))),
+            0,
+            0,
+        );
+        let for_errors = Rc::clone(ui);
+        drag.connect_prepare(move |_, _, _| {
+            // A gdk::FileList and not hand-rolled text/uri-list: GTK's own
+            // serialisers for it include the document-portal path, which is
+            // what lets a sandboxed chat client read what it is handed.
+            match Identity::export_pem() {
+                Ok(path) => {
+                    let files = gdk::FileList::from_array(&[gio::File::for_path(path)]);
+                    Some(gdk::ContentProvider::for_value(&files.to_value()))
+                }
+                Err(e) => {
+                    // Returning None just means nothing is dragged, which on
+                    // its own looks like the window ignoring the gesture.
+                    post(&for_errors, Event::Failed(format!("{e:#}")));
+                    None
+                }
+            }
+        });
+        ui.widgets.cert_drag.add_controller(drag);
+    }
+
     {
         let ui = Rc::clone(ui);
         ui.widgets
@@ -484,6 +542,7 @@ fn layout(ui: &Rc<Ui>) -> gtk::Box {
         .build();
     buttons.append(&w.stop_button);
     buttons.append(&w.copy_button);
+    buttons.append(&gtk::Frame::builder().child(&w.cert_drag).build());
     status_box.append(&buttons);
     root.append(
         &gtk::Frame::builder()

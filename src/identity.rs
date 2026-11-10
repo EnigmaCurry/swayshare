@@ -31,6 +31,12 @@ use x509_parser::prelude::*;
 /// so it cannot be mistaken for something still consulted.
 const STALE_NAMES_FILE: &str = "cert.names";
 
+/// The name the certificate is handed to a helper under.
+///
+/// Matches what the invitation tells them to expect, which `cert.pem` - a
+/// name shared by every certificate on their disk - would not.
+const EXPORT_NAME: &str = "swayshare.pem";
+
 /// How many addresses the certificate remembers.
 ///
 /// Addresses accumulate rather than replace, so an identity that has seen an
@@ -104,6 +110,31 @@ impl Identity {
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
     }
+
+    /// Write the certificate out under the name a recipient should see, and
+    /// return the path, for handing to another application.
+    ///
+    /// Written afresh on every call rather than kept in step with the
+    /// certificate: a copy left lying around would be handed over stale after
+    /// a reissue, and a certificate that does not verify is the one outcome
+    /// worth engineering against. Mode 0644 - it is public, and whatever the
+    /// user drags it into has to be able to read it.
+    pub fn export_pem() -> Result<PathBuf> {
+        let pem = Self::stored_pem()?
+            .context("there is no certificate yet - it is created when the daemon first runs")?;
+        write_export(&tls_dir()?, &pem)
+    }
+}
+
+/// Split from [`Identity::export_pem`] so the name and the mode - the two
+/// things another application depends on - can be asserted without writing
+/// into the real data directory.
+fn write_export(dir: &Path, pem: &str) -> Result<PathBuf> {
+    let path = dir.join(EXPORT_NAME);
+    // 0644: the certificate is public, and whatever it is dragged into has to
+    // be able to read it.
+    paths::write_atomic(&path, pem, 0o644)?;
+    Ok(path)
 }
 
 fn tls_dir() -> Result<PathBuf> {
@@ -430,6 +461,28 @@ mod tests {
                 "{wildcard} should not be a SAN: {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_export_is_named_for_the_recipient_and_is_readable() {
+        // Both halves matter to something outside this program: the name is
+        // what the invitation tells the helper to expect, and the mode is
+        // what lets the application it is dragged into open it.
+        let dir = std::env::temp_dir().join(format!("swayshare-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pem = "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n";
+        let path = write_export(&dir, pem).unwrap();
+
+        assert_eq!(path.file_name().unwrap(), "swayshare.pem");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), pem);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "the receiving application must be able to read it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

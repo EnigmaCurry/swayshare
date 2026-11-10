@@ -20,7 +20,10 @@ base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
 getrandom = "0.4.3"
-gtk4 = { version = "0.11.5", optional = true }
+# v4_8 for gdk::FileList::from_array, which is how a file is handed to another
+# application: GTK's serialisers for it include the document-portal path, so a
+# sandboxed chat client can read what it is dropped. GTK 4.8 is from 2022.
+gtk4 = { version = "0.11.5", optional = true, features = ["v4_8"] }
 if-addrs = "0.15.0"
 ipnet = { version = "2.12.2", features = ["serde"] }
 ksni = "0.3.7"
