@@ -131,15 +131,28 @@ audit:
     cargo audit
 
 # End-to-end test of the gate against a real wayvnc on a headless Sway
-e2e:
+#
+# Depends on `build` because the script runs whatever binary is already at
+# target/debug/swayshare rather than building one, so without this a stale
+# binary silently passes tests for code that is no longer there. `build` and
+# not `build-cli`: the three smoke suites share that one path, and a
+# --no-default-features binary has no `gui` subcommand for `gui-smoke` to
+# drive.
+e2e: build
     ./scripts/e2e-smoke.sh
 
 # Test the tray over a private D-Bus session
-tray-smoke:
+#
+# Depends on `build` for the same reason as `e2e`: the script runs whatever is
+# already at target/debug/swayshare instead of building it.
+tray-smoke: build
     ./scripts/tray-smoke.sh
 
 # Test the configuration window under a headless Sway
-gui-smoke:
+#
+# `build` and not `build-cli`: this suite drives the `gui` subcommand, which a
+# --no-default-features binary does not have.
+gui-smoke: build
     ./scripts/gui-smoke.sh
 
 # Run all three smoke suites (needs wayvnc, sway, grim: use `nix develop`)
