@@ -141,6 +141,22 @@ else
     || fail "quit entry missing"
 fi
 
+echo "== a peer added after the tray started must appear =="
+# The window and the CLI both write peers to the config while the tray is
+# already running. menu_about_to_show alone is not enough: that hook fires
+# only if the tray host asks before opening the menu, and not every host
+# does, which left a newly added peer invisible.
+"$BIN" add latecomer 10.0.0.9/32 >/dev/null 2>&1
+sleep 2.5   # the tray polls once a second
+echo "$(menu_layout)" | grep -q "latecomer" \
+  && pass "a peer added while the tray runs shows up in the menu" \
+  || fail "the menu did not pick up a new peer: $(menu_layout)"
+"$BIN" rm latecomer >/dev/null 2>&1
+sleep 2.5
+echo "$(menu_layout)" | grep -q "latecomer" \
+  && fail "a removed peer is still offered: $(menu_layout)" \
+  || pass "a peer removed while the tray runs leaves the menu"
+
 if [ -n "$LIVE" ]; then
   echo "== starting a real session; the item must react =="
   "$BIN" start tester --minutes 5 >/dev/null 2>&1 || fail "could not start a session"

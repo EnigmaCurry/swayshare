@@ -145,6 +145,19 @@ else
   fail "no screenshot captured"
 fi
 
+echo "== a peer added elsewhere must appear in the window =="
+# Peers can be added from the tray or the CLI while this window is open.
+"$BIN" add latecomer 10.0.0.9/32 >/dev/null 2>&1
+sleep 3
+shot 01b-newpeer
+RESULT=$(compare 01-off 01b-newpeer)
+case "$RESULT" in
+  different*) pass "the window picked up a peer added elsewhere ($RESULT)" ;;
+  *)          fail "the window did not show a peer added while it was open" ;;
+esac
+"$BIN" rm latecomer >/dev/null 2>&1
+sleep 3
+
 echo "== the window must follow a session started elsewhere =="
 "$BIN" start mike --minutes 5 >/dev/null 2>&1 || fail "could not start a session from the CLI"
 sleep 4          # one poll tick, plus the invitation round trip

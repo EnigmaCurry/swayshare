@@ -233,6 +233,16 @@ fn build_window(app: &gtk::Application) {
             if tx.send_blocking(Event::StatusPolled(status)).is_err() {
                 break; // the window is gone
             }
+            // Peers are re-read here too, because they can be added or removed
+            // from the tray or the CLI while this window is open - a failed
+            // read means the file is mid-rewrite, not that there are none, so
+            // the last good list stands. PeersLoaded is a no-op when nothing
+            // changed, and the rows are only rebuilt when they differ.
+            if let Ok(cfg) = Config::load()
+                && tx.send_blocking(Event::PeersLoaded(cfg.peers)).is_err()
+            {
+                break;
+            }
             std::thread::sleep(POLL_INTERVAL);
         }
     });

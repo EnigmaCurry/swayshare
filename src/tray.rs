@@ -537,10 +537,22 @@ async fn refresh(handle: &ksni::Handle<SwayshareTray>, socket: &std::path::Path)
         State::Connected => fetch_password(socket).await,
         _ => None,
     };
+    // Peers are reloaded here and not only in `menu_about_to_show`: that hook
+    // fires only if the tray host asks before opening the menu, and not every
+    // host does. Without this, a peer added from the configuration window or
+    // the CLI stayed invisible until something else happened to rebuild the
+    // layout - in practice, until access was granted at least once.
+    let peers = Config::load().map(|c| c.peers).ok();
     handle
         .update(move |tray: &mut SwayshareTray| {
             tray.status = status;
             tray.password = password;
+            // A failed read means the file is being rewritten right now, not
+            // that there are no peers; keeping the last good list stops the
+            // menu flickering to "No peers configured" mid-save.
+            if let Some(peers) = peers {
+                tray.peers = peers;
+            }
         })
         .await
 }
