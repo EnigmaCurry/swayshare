@@ -129,7 +129,7 @@ impl Daemon {
 
         // Generated eagerly so a first-run failure surfaces at daemon start
         // rather than in the middle of a support call.
-        let identity = Identity::ensure()?;
+        let identity = Identity::ensure(None)?;
         eprintln!("swayshare: identity SHA256:{}", identity.fingerprint);
 
         let (events_tx, mut events_rx) = mpsc::channel::<Event>(64);
@@ -279,6 +279,19 @@ impl Daemon {
         // here does not take down a working one.
         let ip = config::resolve_listen_ip(&cfg.network)?;
         let listen = SocketAddr::new(ip, cfg.network.port);
+
+        // The invitation advertises `ip`, and a strict client validates our
+        // certificate against precisely the address it dialled - so the
+        // certificate has to name it. Reissuing changes the fingerprint the
+        // peer may have pinned, so say so where the user can see it.
+        let previous = self.identity.fingerprint.clone();
+        self.identity = Identity::ensure(Some(ip))?;
+        if self.identity.fingerprint != previous {
+            eprintln!(
+                "swayshare: identity reissued to cover {ip}; fingerprint is now SHA256:{}",
+                self.identity.fingerprint
+            );
+        }
 
         if self.session.is_some() {
             self.stop_session("switching to a new peer").await;

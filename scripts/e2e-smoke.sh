@@ -151,9 +151,12 @@ CA="$XDG_DATA_HOME/swayshare/tls/cert.pem"
 PASSWORD=$("$BIN" invite --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
 CLIENT="$(dirname "$0")/vnc_client.py"
 rm -f "$SB/KEY_ARRIVED"
+# --check-hostname is the point of this call as much as the keystroke is: the
+# invitation advertises a bare IP, and a strict viewer verifies the certificate
+# against precisely that, so the certificate has to carry it as an IP SAN.
 if python3 "$CLIENT" --port "$PORT" --password "$PASSWORD" --ca "$CA" \
-     --send-key 0x61 --repeat 3 --hold 1 > "$SB/client.log" 2>&1; then
-  pass "VeNCrypt session completed, certificate verified against our own cert"
+     --check-hostname --send-key 0x61 --repeat 3 --hold 1 > "$SB/client.log" 2>&1; then
+  pass "VeNCrypt session completed, certificate verified and names our address"
 else
   fail "the authenticated session failed: $(tail -2 "$SB/client.log")"
 fi

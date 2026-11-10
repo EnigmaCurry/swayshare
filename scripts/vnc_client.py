@@ -41,7 +41,7 @@ def recv_exact(sock, n):
     return buf
 
 
-def handshake(sock, username, password, ca_file, verbose):
+def handshake(sock, username, password, ca_file, verbose, server_name=None):
     def log(msg):
         if verbose:
             print(f"  {msg}")
@@ -88,19 +88,28 @@ def handshake(sock, username, password, ca_file, verbose):
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
+    verify_name = None
     if ca_file and chosen == X509_PLAIN:
         # Verifying against swayshare's stored certificate proves the identity
         # it advertises in the invitation is the one actually presented.
         context.verify_mode = ssl.CERT_REQUIRED
         context.load_verify_locations(cafile=ca_file)
         log(f"verifying the server certificate against {ca_file}")
+        if server_name:
+            # A real viewer also checks that the certificate *names* the
+            # address it dialled; wlvncc and gtk-vnc both refuse outright when
+            # it does not. Invitations only ever carry a bare IP, so this is
+            # what holds swayshare to issuing an IP SAN for the bound address.
+            context.check_hostname = True
+            verify_name = server_name
+            log(f"requiring the certificate to name {server_name}")
     else:
         context.verify_mode = ssl.CERT_NONE
         if chosen == TLS_PLAIN:
             # Anonymous TLS has no certificate to check.
             context.set_ciphers("ALL:@SECLEVEL=0")
     try:
-        tls = context.wrap_socket(sock)
+        tls = context.wrap_socket(sock, server_hostname=verify_name)
     except ssl.SSLError as e:
         fail(f"TLS handshake failed: {e}")
     log(f"TLS established: {tls.version()}")
@@ -136,6 +145,8 @@ def main():
     ap.add_argument("--username", default="support")
     ap.add_argument("--password", required=True)
     ap.add_argument("--ca", help="PEM file to verify the server certificate against")
+    ap.add_argument("--check-hostname", action="store_true",
+                    help="also require the certificate to name --host, as real viewers do")
     ap.add_argument("--source", help="bind this source address before connecting")
     ap.add_argument("--send-key", type=lambda v: int(v, 0), default=None,
                     help="X11 keysym to press and release, e.g. 0x61 for 'a'")
@@ -154,6 +165,8 @@ def main():
                 "--username", args.username, "--password", args.password]
         if args.ca:
             argv += ["--ca", args.ca]
+        if args.check_hostname:
+            argv += ["--check-hostname"]
         proc = subprocess.run(argv, capture_output=True, text=True)
         if proc.returncode == 0:
             fail("authentication succeeded but should have been rejected")
@@ -171,7 +184,8 @@ def main():
     except OSError as e:
         fail(f"could not connect to {args.host}:{args.port}: {e}")
 
-    tls = handshake(sock, args.username, args.password, args.ca, args.verbose)
+    tls = handshake(sock, args.username, args.password, args.ca, args.verbose,
+                    args.host if args.check_hostname else None)
 
     if args.send_key is not None:
         for _ in range(args.repeat):
