@@ -11,8 +11,22 @@
 # (CIDR parsing, the breadth policy, config writes, the control protocol) is
 # covered by unit and integration tests instead.
 #
+# It runs under `dbus-run-session`, for the same reason the tray suite does:
+# a GtkApplication is single-instance per application ID on the session bus,
+# so on a developer's own desktop - where a swayshare window is quite likely
+# to be open already - launching one here would hand off to that window and
+# exit without ever mapping one of its own. The failure looks exactly like
+# the window being broken.
+#
 # Usage:  nix develop -c ./scripts/gui-smoke.sh
 set -u
+
+if [ -z "${SWAYSHARE_GUI_SMOKE_BUS:-}" ]; then
+  command -v dbus-run-session >/dev/null \
+    || { echo "dbus-run-session is required (try: nix develop)"; exit 1; }
+  export SWAYSHARE_GUI_SMOKE_BUS=1
+  exec dbus-run-session -- "$0" "$@"
+fi
 
 BIN=${SWAYSHARE_BIN:-$(dirname "$0")/../target/debug/swayshare}
 BIN=$(realpath "$BIN")

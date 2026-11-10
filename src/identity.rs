@@ -31,11 +31,8 @@ use x509_parser::prelude::*;
 /// so it cannot be mistaken for something still consulted.
 const STALE_NAMES_FILE: &str = "cert.names";
 
-/// The name the certificate is handed to a helper under.
-///
-/// Matches what the invitation tells them to expect, which `cert.pem` - a
-/// name shared by every certificate on their disk - would not.
-const EXPORT_NAME: &str = "swayshare.pem";
+/// Used when the hostname is unreadable or unusable.
+const FALLBACK_EXPORT_NAME: &str = "swayshare.pem";
 
 /// How many addresses the certificate remembers.
 ///
@@ -130,7 +127,7 @@ impl Identity {
 /// things another application depends on - can be asserted without writing
 /// into the real data directory.
 fn write_export(dir: &Path, pem: &str) -> Result<PathBuf> {
-    let path = dir.join(EXPORT_NAME);
+    let path = dir.join(export_name());
     // 0644: the certificate is public, and whatever it is dragged into has to
     // be able to read it.
     paths::write_atomic(&path, pem, 0o644)?;
@@ -213,6 +210,37 @@ fn ip_from_octets(octets: &[u8]) -> Option<IpAddr> {
         16 => Some(IpAddr::from(<[u8; 16]>::try_from(octets).ok()?)),
         _ => None,
     }
+}
+
+/// The name the certificate is handed to a helper under.
+///
+/// Carries the hostname, because the recipient may be holding certificates
+/// from several people and `cert.pem` - or a bare `swayshare.pem` - tells
+/// them nothing about which machine any of them belongs to.
+pub fn export_name() -> String {
+    match filename_part(&hostname()) {
+        Some(host) => format!("swayshare_{host}.pem"),
+        None => FALLBACK_EXPORT_NAME.to_string(),
+    }
+}
+
+/// The hostname reduced to something safe to put in a filename, or `None` if
+/// nothing usable is left.
+///
+/// Only the first label: an FQDN would otherwise produce a name with several
+/// dots in it, which reads badly and which some clients treat as having an
+/// unexpected extension. Anything outside a conservative set is dropped
+/// rather than substituted - this is a label for a human, not an identifier,
+/// and the fingerprint is what actually distinguishes two machines.
+fn filename_part(hostname: &str) -> Option<String> {
+    let label: String = hostname
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    (!label.is_empty()).then_some(label)
 }
 
 fn hostname() -> String {
@@ -464,6 +492,26 @@ mod tests {
     }
 
     #[test]
+    fn the_export_name_carries_the_hostname() {
+        assert_eq!(filename_part("flux").as_deref(), Some("flux"));
+        // Only the first label of an FQDN.
+        assert_eq!(filename_part("flux.example.com").as_deref(), Some("flux"));
+        // Nothing that could escape the directory or confuse a filename.
+        assert_eq!(filename_part("a b/c").as_deref(), Some("abc"));
+        assert_eq!(filename_part("evil/../name").as_deref(), Some("evil"));
+        // Nothing usable in the first label: falls back rather than inventing
+        // a name out of the rest of the string.
+        assert_eq!(filename_part("../../etc"), None);
+        assert_eq!(filename_part("///"), None);
+        assert_eq!(filename_part(""), None);
+
+        let name = export_name();
+        assert!(name.starts_with("swayshare"), "{name}");
+        assert!(name.ends_with(".pem"), "{name}");
+        assert!(!name.contains('/'), "{name}");
+    }
+
+    #[test]
     fn the_export_is_named_for_the_recipient_and_is_readable() {
         // Both halves matter to something outside this program: the name is
         // what the invitation tells the helper to expect, and the mode is
@@ -473,7 +521,7 @@ mod tests {
         let pem = "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n";
         let path = write_export(&dir, pem).unwrap();
 
-        assert_eq!(path.file_name().unwrap(), "swayshare.pem");
+        assert_eq!(path.file_name().unwrap(), export_name().as_str());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), pem);
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

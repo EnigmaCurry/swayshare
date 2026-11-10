@@ -166,11 +166,11 @@ Password: I will read it to you when you connect
 You will have full control of the screen, keyboard and pointer,
 at the same time as me.
 
-I will also send you swayshare.pem - the certificate your client
-checks this machine against. Compare its fingerprint with the one
-above. Only one field wants it: in Remmina that is "CA certificate",
-and the CRL, client certificate and client key fields must be left
-empty.
+I will also send you swayshare_flux.pem - the certificate your
+client checks this machine against. Compare its fingerprint with
+the one above. Only one field wants it: in Remmina that is the
+"CA certificate" field; the CRL, client certificate and client
+key fields must be left empty.
 
 Connect through the VPN tunnel. When you connect I will read
 you a one-time password to type in - it is different every
@@ -193,12 +193,17 @@ something. Send them the certificate — it is public, and
 `swayshare cert` prints it:
 
 ```sh
-swayshare cert > swayshare.pem    # send this file to your helper
+swayshare cert > swayshare_$(hostname).pem   # send this file to your helper
 ```
 
+The name carries your hostname, because the person helping you may be
+holding certificates from several people and `cert.pem` tells them nothing
+about which machine any of them is for. `swayshare cert` prints the name to
+use on stderr.
+
 In the configuration window it is a drag handle next to **Copy invitation** —
-drag `swayshare.pem` straight into your chat client and send it, without
-going looking for the file.
+drag it straight into your chat client and send it, without going looking
+for the file.
 
 The fingerprint in the invitation is what makes that safe to send over any
 channel: they compare it against the file before trusting it.
@@ -232,12 +237,12 @@ like from the other side.
 client:
 
 ```sh
-vncviewer -SecurityTypes=X509Plain -X509CA=swayshare.pem HOST:5900
+vncviewer -SecurityTypes=X509Plain -X509CA=swayshare_flux.pem HOST:5900
 ```
 
 [Remmina](https://remmina.org) works too. Set **Username** to the one in the
 invitation, connect, and when the certificate dialog appears pick
-`swayshare.pem` as the CA certificate, leaving CRL, client certificate and
+the `.pem` file as the CA certificate, leaving CRL, client certificate and
 client key blank. Remmina remembers the CA path, so later connections only
 need the dialog confirmed. The dialog cannot be skipped entirely: Remmina
 only bypasses it when all four fields are set, and setting the client

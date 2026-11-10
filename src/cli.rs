@@ -277,9 +277,9 @@ async fn show_invite(json: bool) -> Result<()> {
 
 /// Print the stored certificate, for the owner to pass on to their helper.
 ///
-/// The PEM goes to stdout alone, so `swayshare cert > swayshare.pem` produces
-/// a file a client can use directly; the fingerprint and any warning are
-/// commentary and go to stderr.
+/// The PEM goes to stdout alone, so redirecting it produces a file a client
+/// can use directly; the fingerprint, the name to save it under and any
+/// warning are commentary and go to stderr.
 async fn show_cert() -> Result<()> {
     let Some(pem) = Identity::stored_pem()? else {
         bail!(
@@ -292,6 +292,9 @@ async fn show_cert() -> Result<()> {
         "swayshare: SHA256:{}",
         identity::fingerprint_from_pem(&pem)?
     );
+    // The recipient may be holding certificates from several people, so
+    // suggest the name that says which machine this one is for.
+    eprintln!("swayshare: save this as {}", identity::export_name());
 
     // A certificate sent before access is granted may not name the address
     // that gets shared, in which case granting access reissues it and the

@@ -19,7 +19,7 @@
 //! would otherwise freeze the UI.
 
 use crate::config::Config;
-use crate::identity::Identity;
+use crate::identity::{self, Identity};
 use crate::ipc::{self, Request, Response};
 use crate::paths;
 use crate::window::{self, Effect, Event, Model};
@@ -130,7 +130,13 @@ fn build_window(app: &gtk::Application) {
                 .margin_end(8)
                 .build();
             row.append(&gtk::Image::from_icon_name("application-certificate"));
-            row.append(&gtk::Label::builder().label("swayshare.pem").build());
+            // The name alone looked like a static label; saying so outright is
+            // the only reliable affordance for a drag source.
+            row.append(
+                &gtk::Label::builder()
+                    .label(format!("{} (drag and drop me)", identity::export_name()))
+                    .build(),
+            );
             row
         },
         invitation: gtk::TextView::builder()

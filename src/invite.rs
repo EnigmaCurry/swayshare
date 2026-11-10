@@ -1,5 +1,6 @@
 //! Rendering of the invitation the user sends to their helper.
 
+use crate::identity;
 use crate::ipc::{AccessMode, Session};
 
 /// Format the connection details as a block the user can paste into a chat.
@@ -34,11 +35,17 @@ pub fn render(session: &Session) -> String {
     // Without the certificate a strict client cannot verify us and simply
     // refuses; and the one real trap is that clients ask for up to four
     // certificate files when only this one is used, so say so outright.
-    out.push_str("I will also send you swayshare.pem - the certificate your client\n");
-    out.push_str("checks this machine against. Compare its fingerprint with the one\n");
-    out.push_str("above. Only one field wants it: in Remmina that is \"CA certificate\",\n");
-    out.push_str("and the CRL, client certificate and client key fields must be left\n");
-    out.push_str("empty.\n");
+    // Named for this machine: the recipient may be holding certificates from
+    // several people, and the name is the only thing distinguishing them
+    // before they open one.
+    out.push_str(&format!(
+        "I will also send you {} - the certificate your\n",
+        identity::export_name()
+    ));
+    out.push_str("client checks this machine against. Compare its fingerprint with\n");
+    out.push_str("the one above. Only one field wants it: in Remmina that is the\n");
+    out.push_str("\"CA certificate\" field; the CRL, client certificate and client\n");
+    out.push_str("key fields must be left empty.\n");
     out.push('\n');
     out.push_str("Connect through the VPN tunnel. When you connect I will read\n");
     out.push_str("you a one-time password to type in - it is different every\n");
@@ -103,15 +110,15 @@ mod tests {
         // wrong is what makes a working setup look like a broken client.
         let text = render(&session());
         assert!(
-            text.contains("swayshare.pem"),
-            "the invitation must say a certificate is coming: {text}"
+            text.contains(&identity::export_name()),
+            "the invitation must name the file that is coming: {text}"
         );
         assert!(
             text.contains("CA certificate"),
             "it must name the field the certificate goes in: {text}"
         );
         assert!(
-            text.contains("must be left\nempty"),
+            text.contains("must be left empty"),
             "it must say the other certificate fields stay empty: {text}"
         );
     }
