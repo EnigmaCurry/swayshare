@@ -1,5 +1,7 @@
 # swayshare
 
+*EXPERIMENTAL*
+
 Temporary, peer-scoped remote desktop access for [Sway](https://swaywm.org),
 [Hyprland](https://hypr.land) and other
 [wlroots](https://gitlab.freedesktop.org/wlroots/wlroots)-based Wayland
