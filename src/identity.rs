@@ -11,6 +11,12 @@
 //! `gnutls_x509_crt_check_hostname` and gtk-vnc does the equivalent, both of
 //! which fail outright against a certificate holding only DNS names. So the
 //! listen address is carried as an IP SAN.
+//!
+//! Which addresses a stored certificate covers is read back out of the
+//! certificate itself. The alternative - recording them in a file beside it -
+//! has a failure mode this does not: the record and the certificate can
+//! disagree, and then a perfectly good identity gets reissued because its
+//! notes went missing.
 
 use crate::paths;
 use anyhow::{Context, Result, bail};
@@ -18,13 +24,12 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use x509_parser::prelude::*;
 
-/// Records the SANs the stored certificate was issued for.
-///
-/// Reading them back from the certificate would mean parsing X.509; this file
-/// is written beside it instead, so `ensure` can tell whether the address it
-/// has been handed is already covered.
-const NAMES_FILE: &str = "cert.names";
+/// Left beside the certificate by earlier versions, which recorded the SANs
+/// in a file rather than reading them from the certificate. Removed on sight
+/// so it cannot be mistaken for something still consulted.
+const STALE_NAMES_FILE: &str = "cert.names";
 
 /// How many addresses the certificate remembers.
 ///
@@ -54,29 +59,25 @@ impl Identity {
         paths::ensure_private_dir(&dir)?;
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
-        let names_path = dir.join(NAMES_FILE);
+        paths::remove_if_present(&dir.join(STALE_NAMES_FILE));
 
-        let have_pair = cert_path.exists() && key_path.exists();
-        let stored = if have_pair {
-            read_names(&names_path)
+        // Both or neither: a certificate whose key is gone cannot be
+        // presented, and a half-written pair fails obscurely inside wayvnc.
+        let stored = if cert_path.exists() && key_path.exists() {
+            std::fs::read_to_string(&cert_path).ok()
         } else {
-            // Without a pair the recorded names describe nothing.
-            Vec::new()
+            None
         };
-        let wanted = desired_names(&stored, listen_ip);
+        let covered = stored.as_deref().map(covered_addresses).unwrap_or_default();
 
-        // Regenerate both together: a cert paired with a lost key is useless,
-        // and a half-written pair would fail obscurely in wayvnc. Compare as a
-        // set, not a sequence - `wanted` is in recency order, so alternating
-        // between two tunnels reorders it without changing what it covers, and
-        // reissuing for that would churn the fingerprint for no reason.
-        if !have_pair || !covers_same(&wanted, &stored) {
-            generate(&cert_path, &key_path, &wanted)?;
-        }
-        if wanted != stored {
-            // Order carries the recency the cap evicts by, so persist it even
-            // when the certificate itself was left alone.
-            write_names(&names_path, &wanted)?;
+        // An address the certificate does not name is the one thing worth
+        // reissuing for, because that is what a strict client refuses over.
+        // Notably absent from this decision: the DNS names. They are carried
+        // for completeness, but renaming a machine must not rotate an
+        // identity a helper has already pinned.
+        let fresh = address_to_add(&covered, listen_ip);
+        if stored.is_none() || fresh.is_some() {
+            generate(&cert_path, &key_path, &desired_names(&covered, fresh))?;
         }
 
         let pem = std::fs::read_to_string(&cert_path)
@@ -109,11 +110,23 @@ fn tls_dir() -> Result<PathBuf> {
     Ok(paths::data_dir()?.join("tls"))
 }
 
+/// The address that forces a reissue, if any.
+///
+/// Split out from [`Identity::ensure`] because it is the whole stability
+/// contract: anything this returns `None` for keeps the existing fingerprint.
+fn address_to_add(covered: &[IpAddr], listen_ip: Option<IpAddr>) -> Option<IpAddr> {
+    // A wildcard bind names no particular host, so nothing can validate
+    // against it and it is not worth reissuing for.
+    listen_ip.filter(|ip| !ip.is_unspecified() && !covered.contains(ip))
+}
+
 /// The SANs the certificate should carry, most recently used address first.
 ///
-/// The DNS names are always present and always first; addresses follow, with
-/// `listen_ip` promoted to the front so the cap drops the stalest one.
-fn desired_names(stored: &[String], listen_ip: Option<IpAddr>) -> Vec<String> {
+/// DNS names come first and are always present; addresses follow, with
+/// `fresh` promoted to the front so the cap drops the stalest one. rcgen reads
+/// an entry that parses as an address as an IP SAN and anything else as a DNS
+/// SAN, so one list expresses both.
+fn desired_names(covered: &[IpAddr], fresh: Option<IpAddr>) -> Vec<String> {
     let mut names = vec!["swayshare".to_string()];
     let hostname = hostname();
     if !hostname.is_empty() && hostname != "swayshare" {
@@ -121,15 +134,10 @@ fn desired_names(stored: &[String], listen_ip: Option<IpAddr>) -> Vec<String> {
     }
 
     let mut ips: Vec<IpAddr> = Vec::new();
-    if let Some(ip) = listen_ip {
-        ips.push(ip);
-    }
-    // A wildcard bind names no particular host, so it cannot be validated
-    // against and is not worth spending a remembered slot on.
-    ips.retain(|ip| !ip.is_unspecified());
-    for ip in stored.iter().filter_map(|s| s.parse::<IpAddr>().ok()) {
-        if !ips.contains(&ip) {
-            ips.push(ip);
+    ips.extend(fresh);
+    for ip in covered {
+        if !ips.contains(ip) {
+            ips.push(*ip);
         }
     }
     ips.truncate(MAX_REMEMBERED_IPS);
@@ -138,36 +146,48 @@ fn desired_names(stored: &[String], listen_ip: Option<IpAddr>) -> Vec<String> {
     names
 }
 
-/// Whether two SAN lists cover the same names, ignoring order.
-fn covers_same(a: &[String], b: &[String]) -> bool {
-    a.len() == b.len() && a.iter().all(|n| b.contains(n))
+/// The addresses a stored certificate already names.
+///
+/// Returned in the certificate's own SAN order, which is the order they were
+/// written - most recently used first - so recency survives a round trip
+/// without being recorded anywhere else.
+///
+/// A certificate we cannot parse reads as covering nothing, which reissues it.
+/// That is the safe direction: the alternative is presenting a certificate
+/// whose contents we could not confirm.
+fn covered_addresses(pem: &str) -> Vec<IpAddr> {
+    let Ok(der) = der_from_pem(pem) else {
+        return Vec::new();
+    };
+    let Ok((_, cert)) = X509Certificate::from_der(&der) else {
+        return Vec::new();
+    };
+    let Ok(Some(san)) = cert.subject_alternative_name() else {
+        return Vec::new();
+    };
+    san.value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::IPAddress(octets) => ip_from_octets(octets),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An IP SAN is stored as raw network-order octets: 4 for v4, 16 for v6.
+fn ip_from_octets(octets: &[u8]) -> Option<IpAddr> {
+    match octets.len() {
+        4 => Some(IpAddr::from(<[u8; 4]>::try_from(octets).ok()?)),
+        16 => Some(IpAddr::from(<[u8; 16]>::try_from(octets).ok()?)),
+        _ => None,
+    }
 }
 
 fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|h| h.trim().to_string())
         .unwrap_or_default()
-}
-
-fn read_names(path: &Path) -> Vec<String> {
-    // A missing or unreadable record just means "nothing known", which
-    // reissues the certificate - correct, and no worse than first run.
-    std::fs::read_to_string(path)
-        .map(|text| {
-            text.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn write_names(path: &Path, names: &[String]) -> Result<()> {
-    let mut text = names.join("\n");
-    text.push('\n');
-    // Public, like the certificate it describes.
-    paths::write_atomic(path, &text, 0o644)
 }
 
 fn generate(cert_path: &Path, key_path: &Path, names: &[String]) -> Result<()> {
@@ -182,8 +202,8 @@ fn generate(cert_path: &Path, key_path: &Path, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Compute the DER fingerprint of the first certificate in a PEM bundle.
-pub fn fingerprint_from_pem(pem: &str) -> Result<String> {
+/// The DER bytes of the first certificate in a PEM bundle.
+fn der_from_pem(pem: &str) -> Result<Vec<u8>> {
     let body: String = pem
         .lines()
         .skip_while(|l| !l.starts_with("-----BEGIN CERTIFICATE-----"))
@@ -194,10 +214,14 @@ pub fn fingerprint_from_pem(pem: &str) -> Result<String> {
     if body.is_empty() {
         bail!("no CERTIFICATE block found in the stored PEM file");
     }
-    let der = base64::engine::general_purpose::STANDARD
+    base64::engine::general_purpose::STANDARD
         .decode(body.as_bytes())
-        .context("decoding the certificate PEM body")?;
-    let digest = Sha256::digest(&der);
+        .context("decoding the certificate PEM body")
+}
+
+/// Compute the DER fingerprint of the first certificate in a PEM bundle.
+pub fn fingerprint_from_pem(pem: &str) -> Result<String> {
+    let digest = Sha256::digest(der_from_pem(pem)?);
     Ok(digest
         .iter()
         .map(|b| format!("{b:02X}"))
@@ -273,11 +297,82 @@ mod tests {
         assert!(names.contains(&"swayshare".to_string()));
     }
 
+    /// Generate a pair in a scratch directory and hand back the certificate.
+    ///
+    /// The directory is unique per call: these tests run concurrently, and a
+    /// shared path means one removing it while another is still writing.
+    fn generated_pem(names: &[String]) -> String {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("swayshare-id-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        generate(&cert, &dir.join("key.pem"), names).unwrap();
+        let pem = std::fs::read_to_string(&cert).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        pem
+    }
+
     #[test]
-    fn ipv6_addresses_are_carried_too() {
-        let ip: IpAddr = "fd00::10".parse().unwrap();
-        let names = desired_names(&[], Some(ip));
-        assert!(names.contains(&"fd00::10".to_string()), "{names:?}");
+    fn addresses_survive_a_round_trip_through_the_certificate() {
+        // The whole point of reading SANs back out of the certificate: what
+        // went in has to come out, or every run would look like a new address
+        // and reissue.
+        for addr in ["192.0.2.10", "fd00::10"] {
+            let ip: IpAddr = addr.parse().unwrap();
+            let pem = generated_pem(&desired_names(&[], Some(ip)));
+            assert_eq!(
+                covered_addresses(&pem),
+                vec![ip],
+                "{addr} should be readable back out of its own certificate"
+            );
+        }
+    }
+
+    #[test]
+    fn recency_order_survives_the_round_trip() {
+        // The cap evicts the stalest address, so the order the certificate
+        // names them in has to be the order they were last used.
+        let first: IpAddr = "192.0.2.10".parse().unwrap();
+        let second: IpAddr = "198.51.100.5".parse().unwrap();
+        let pem = generated_pem(&desired_names(&[first], Some(second)));
+        assert_eq!(covered_addresses(&pem), vec![second, first]);
+    }
+
+    #[test]
+    fn a_covered_address_never_reissues() {
+        let ip: IpAddr = "192.0.2.10".parse().unwrap();
+        assert_eq!(address_to_add(&[ip], Some(ip)), None);
+        // Still true when it is not the most recent of several.
+        let other: IpAddr = "198.51.100.5".parse().unwrap();
+        assert_eq!(address_to_add(&[other, ip], Some(ip)), None);
+    }
+
+    #[test]
+    fn renaming_the_machine_does_not_reissue() {
+        // The reissue decision must not look at DNS names at all: a cosmetic
+        // rename rotating the identity would invalidate every copy of the
+        // certificate a helper has already saved.
+        let ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let pem = generated_pem(&[
+            "swayshare".to_string(),
+            "the-old-hostname".to_string(),
+            ip.to_string(),
+        ]);
+        assert_eq!(
+            address_to_add(&covered_addresses(&pem), Some(ip)),
+            None,
+            "a certificate naming a different hostname must still be kept"
+        );
+    }
+
+    #[test]
+    fn an_uncovered_address_does_reissue() {
+        let known: IpAddr = "192.0.2.10".parse().unwrap();
+        let fresh: IpAddr = "198.51.100.5".parse().unwrap();
+        assert_eq!(address_to_add(&[known], Some(fresh)), Some(fresh));
+        // Nothing stored yet, and nothing known: still has to be issued.
+        assert_eq!(address_to_add(&[], Some(fresh)), Some(fresh));
     }
 
     #[test]
@@ -286,27 +381,26 @@ mod tests {
         let second: IpAddr = "198.51.100.5".parse().unwrap();
 
         let after_first = desired_names(&[], Some(first));
-        let after_second = desired_names(&after_first, Some(second));
+        let covered = covered_addresses(&generated_pem(&after_first));
+        let after_second = desired_names(&covered, address_to_add(&covered, Some(second)));
         assert!(after_second.contains(&"192.0.2.10".to_string()));
         assert!(after_second.contains(&"198.51.100.5".to_string()));
 
-        // Coming back to the first address must not change what is covered,
-        // or the fingerprint would flap every time the tunnel changed.
-        let back_to_first = desired_names(&after_second, Some(first));
-        assert!(
-            covers_same(&back_to_first, &after_second),
-            "{back_to_first:?} should cover the same names as {after_second:?}"
-        );
+        // Coming back to the first address must not reissue, or the
+        // fingerprint would flap every time the tunnel changed.
+        let both = covered_addresses(&generated_pem(&after_second));
+        assert_eq!(address_to_add(&both, Some(first)), None);
+        assert_eq!(address_to_add(&both, Some(second)), None);
     }
 
     #[test]
     fn the_current_address_is_kept_when_the_cap_evicts() {
         // Fill every slot, then bind one more: the newest must survive.
-        let stored: Vec<String> = (0..MAX_REMEMBERED_IPS)
-            .map(|i| format!("192.0.2.{}", i + 1))
+        let covered: Vec<IpAddr> = (0..MAX_REMEMBERED_IPS)
+            .map(|i| format!("192.0.2.{}", i + 1).parse().unwrap())
             .collect();
         let fresh: IpAddr = "198.51.100.5".parse().unwrap();
-        let names = desired_names(&stored, Some(fresh));
+        let names = desired_names(&covered, Some(fresh));
 
         let ips: Vec<&String> = names
             .iter()
@@ -325,10 +419,12 @@ mod tests {
 
     #[test]
     fn a_wildcard_bind_is_not_remembered() {
-        // 0.0.0.0 names no host, so it cannot be validated against.
+        // 0.0.0.0 names no host, so it cannot be validated against and must
+        // not trigger a reissue either.
         for wildcard in ["0.0.0.0", "::"] {
             let ip: IpAddr = wildcard.parse().unwrap();
-            let names = desired_names(&[], Some(ip));
+            assert_eq!(address_to_add(&[], Some(ip)), None);
+            let names = desired_names(&[], address_to_add(&[], Some(ip)));
             assert!(
                 !names.contains(&wildcard.to_string()),
                 "{wildcard} should not be a SAN: {names:?}"
@@ -337,10 +433,13 @@ mod tests {
     }
 
     #[test]
-    fn reordering_alone_does_not_count_as_a_change() {
-        let a = vec!["swayshare".to_string(), "192.0.2.1".to_string()];
-        let b = vec!["192.0.2.1".to_string(), "swayshare".to_string()];
-        assert!(covers_same(&a, &b));
-        assert!(!covers_same(&a, &["swayshare".to_string()]));
+    fn an_unparseable_certificate_is_treated_as_covering_nothing() {
+        // The safe direction: reissue rather than present a certificate whose
+        // contents we could not confirm.
+        assert!(covered_addresses("not a pem file").is_empty());
+        assert!(
+            covered_addresses("-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n")
+                .is_empty()
+        );
     }
 }

@@ -199,6 +199,21 @@ swayshare cert > swayshare.pem    # send this file to your helper
 The fingerprint in the invitation is what makes that safe to send over any
 channel: they compare it against the file before trusting it.
 
+**It is stable, so they only save it once.** The pair is created in
+`~/.local/share/swayshare/tls/` the first time the daemon runs, and is
+reissued only when a session needs an address the certificate does not
+already name — which is what a strict client refuses over. Addresses
+accumulate rather than replace (up to eight), so a machine that moves between
+two tunnels settles after seeing each one once. Nothing else rotates it:
+renaming the machine does not, and neither does restarting. It carries no
+expiry.
+
+The practical consequence is a single ordering rule: **grant access once
+before sending the certificate.** The very first `swayshare start` on a new
+install adds the address, and that is the one reissue a helper could
+otherwise be caught by. `swayshare cert` warns when nothing is being shared
+for exactly this reason.
+
 **Only the CA field takes it.** This is the one step that trips people up.
 Clients ask for up to four certificate files — CA certificate, CA CRL, client
 certificate, client key — but a swayshare session uses exactly one. Fill in

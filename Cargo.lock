@@ -1490,6 +1490,7 @@ dependencies = [
  "sha2",
  "tokio",
  "toml",
+ "x509-parser",
  "zeroize",
 ]
 

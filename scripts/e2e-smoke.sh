@@ -172,6 +172,30 @@ sleep 1.5
   && pass "the remote key press reached Sway (full control works)" \
   || fail "a control session did not deliver input to the compositor"
 
+echo "== the certificate the helper saved keeps working =="
+# A helper saves swayshare.pem once. If a later session reissued the
+# certificate, their copy would stop verifying and they would be locked out
+# for no reason they could see - so restarting on the same address must not
+# change the identity.
+FP_BEFORE=$("$BIN" cert 2>&1 >/dev/null | grep -o 'SHA256:.*')
+"$BIN" stop >/dev/null 2>&1
+"$BIN" start tester --minutes 5 >/dev/null 2>&1 \
+  || fail "could not restart the session"
+FP_AFTER=$("$BIN" cert 2>&1 >/dev/null | grep -o 'SHA256:.*')
+if [ -n "$FP_BEFORE" ] && [ "$FP_BEFORE" = "$FP_AFTER" ]; then
+  pass "the fingerprint survived a restart on the same address"
+else
+  fail "the identity was reissued: $FP_BEFORE -> $FP_AFTER"
+fi
+# And the saved PEM still authenticates, not merely matches by fingerprint.
+PASSWORD=$("$BIN" invite --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
+if python3 "$CLIENT" --port "$PORT" --password "$PASSWORD" --ca "$CA" \
+     --check-hostname > "$SB/client-reuse.log" 2>&1; then
+  pass "the certificate saved before the restart still verifies"
+else
+  fail "the saved certificate stopped working: $(tail -2 "$SB/client-reuse.log")"
+fi
+
 echo "== the wrong password is refused =="
 if python3 "$CLIENT" --port "$PORT" --password WRONGWRONGWRONGWRONGWRONG0 --ca "$CA" \
      --expect-auth-failure > "$SB/badpw.log" 2>&1; then
