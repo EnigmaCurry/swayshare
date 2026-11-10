@@ -47,6 +47,11 @@ struct Widgets {
     enable_button: gtk::Button,
     stop_button: gtk::Button,
     copy_button: gtk::Button,
+    /// The one-time password and its copy button, shown only while someone is
+    /// waiting to type it. See [`window::Model::password_to_read`].
+    password: gtk::Label,
+    copy_password_button: gtk::Button,
+    password_row: gtk::Box,
     add_button: gtk::Button,
     remove_button: gtk::Button,
     invitation: gtk::TextView,
@@ -118,6 +123,18 @@ fn build_window(app: &gtk::Application) {
         enable_button: gtk::Button::with_label("Enable access"),
         stop_button: gtk::Button::with_label("Revoke access"),
         copy_button: gtk::Button::with_label("Copy invitation"),
+        password: gtk::Label::builder()
+            .label("")
+            .xalign(0.0)
+            .selectable(true)
+            .css_classes(["title-3"])
+            .build(),
+        copy_password_button: gtk::Button::with_label("Copy password"),
+        password_row: gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .margin_top(4)
+            .build(),
         add_button: gtk::Button::with_label("Add"),
         remove_button: gtk::Button::with_label("Remove selected peer"),
         cert_drag: {
@@ -150,6 +167,10 @@ fn build_window(app: &gtk::Application) {
             .build(),
     };
     widgets.enable_button.add_css_class("suggested-action");
+    widgets.password.set_selectable(true);
+    widgets
+        .copy_password_button
+        .set_tooltip_text(Some("Copy the one-time password to the clipboard."));
     widgets.cert_drag.set_tooltip_text(Some(
         "The certificate your helper needs. Drag it into your chat and send it.\n\
              Enable access first, so it covers the address you are sharing from.",
@@ -349,6 +370,20 @@ fn render(ui: &Rc<Ui>) {
     w.heading.set_label(model.heading());
     w.detail.set_label(&model.detail());
 
+    // The whole row comes and goes: an empty "Read aloud to let them in:"
+    // sitting there when nobody is connecting would be a standing invitation
+    // to misread the next thing that appears beside it.
+    match model.password_to_read() {
+        Some(password) => {
+            w.password.set_label(password);
+            w.password_row.set_visible(true);
+        }
+        None => {
+            w.password.set_label("");
+            w.password_row.set_visible(false);
+        }
+    }
+
     match &model.message {
         Some(message) => {
             w.message.set_label(&message.text);
@@ -471,6 +506,9 @@ fn wire(ui: &Rc<Ui>) {
     on!(ui.widgets.copy_button, connect_clicked, |_| {
         Event::CopyClicked
     });
+    on!(ui.widgets.copy_password_button, connect_clicked, |_| {
+        Event::CopyPasswordClicked
+    });
     on!(ui.widgets.minutes, connect_value_changed, |ui| {
         Event::MinutesChanged(ui.widgets.minutes.value().round() as u64)
     });
@@ -552,6 +590,17 @@ fn layout(ui: &Rc<Ui>) -> gtk::Box {
     let status_box = padded_box(gtk::Orientation::Vertical, 4);
     status_box.append(&w.heading);
     status_box.append(&w.detail);
+    let password_prompt = gtk::Label::builder()
+        .label("Read aloud to let them in:")
+        .xalign(0.0)
+        .build();
+    w.password_row.append(&password_prompt);
+    w.password_row.append(&w.password);
+    w.password_row
+        .append(&gtk::Box::builder().hexpand(true).build());
+    w.password_row.append(&w.copy_password_button);
+    status_box.append(&w.password_row);
+
     let buttons = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)

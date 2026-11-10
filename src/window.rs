@@ -73,6 +73,7 @@ pub enum Event {
     EnableClicked,
     StopClicked,
     CopyClicked,
+    CopyPasswordClicked,
     // --- from workers and the poller ---
     StatusPolled(Status),
     PeersLoaded(Vec<Peer>),
@@ -177,6 +178,19 @@ impl Model {
         out
     }
 
+    /// The one-time password to read aloud, if someone is waiting on it.
+    ///
+    /// Gated on the state rather than on merely holding a session: the
+    /// password is rotated the instant a peer disconnects, so a value from a
+    /// previous connection is spent, and showing it would have the owner
+    /// dictate something that cannot work.
+    pub fn password_to_read(&self) -> Option<&str> {
+        match self.status.state {
+            State::Connected => self.session.as_ref().map(|s| s.password.as_str()),
+            _ => None,
+        }
+    }
+
     /// The invitation pane's contents; empty when there is nothing to show.
     pub fn invitation(&self) -> String {
         self.session
@@ -259,6 +273,25 @@ pub fn reduce(model: &mut Model, event: Event) -> Vec<Effect> {
             }
             // Not cached: ask the daemon and copy on the way back.
             None => vec![Effect::FetchInvitation { copy: true }],
+        },
+
+        Event::CopyPasswordClicked => match model.password_to_read() {
+            Some(password) => {
+                let password = password.to_string();
+                // Said aloud by design, but a chat window is sometimes the
+                // only channel there is, and dictating it letter by letter
+                // from a screen is where it gets mistyped.
+                model.message = Some(Message::info("One-time password copied."));
+                vec![Effect::CopyToClipboard(password)]
+            }
+            // Nobody is waiting, so there is nothing current to copy; saying
+            // so beats silently putting a spent secret on the clipboard.
+            None => {
+                model.message = Some(Message::info(
+                    "There is no live password: nobody is waiting to connect.",
+                ));
+                Vec::new()
+            }
         },
 
         Event::StatusPolled(status) => status_polled(model, status),
@@ -390,7 +423,7 @@ fn enable_clicked(model: &mut Model) -> Vec<Effect> {
 }
 
 fn status_polled(model: &mut Model, status: Status) -> Vec<Effect> {
-    let was_off = model.status.state == State::Off;
+    let previous = model.status.state;
     model.status = status;
 
     if model.status.state == State::Off {
@@ -400,7 +433,15 @@ fn status_polled(model: &mut Model, status: Status) -> Vec<Effect> {
         return Vec::new();
     }
 
-    let _ = was_off;
+    // Someone has just opened a connection and is waiting to be let in. The
+    // password is minted fresh for each connection, so whatever this window
+    // is holding belongs to a previous one; fetch the live one before it is
+    // put on screen for the owner to read aloud.
+    if model.status.state == State::Connected && previous != State::Connected {
+        model.adopting = true;
+        return vec![Effect::FetchInvitation { copy: false }];
+    }
+
     if model.session.is_none() && !model.adopting {
         // Sharing was enabled from the tray or the CLI. Pull the invitation in
         // so the window is useful whoever started the session; the flag keeps
@@ -768,6 +809,90 @@ mod tests {
             vec![Effect::FetchInvitation { copy: false }],
             "a failure must not wedge the adoption flag"
         );
+    }
+
+    #[test]
+    fn the_password_is_shown_only_while_someone_waits_to_type_it() {
+        let mut m = model();
+        m.session = Some(session("mike"));
+
+        m.status = status(State::Connected, "mike", AccessMode::Control);
+        assert_eq!(
+            m.password_to_read(),
+            Some(session("mike").password.as_str()),
+            "the owner has to be able to read it aloud"
+        );
+
+        // Rotated the moment they disconnect, so a value held from a previous
+        // connection must never be offered as if it were current.
+        for state in [State::Off, State::Listening, State::Authenticated] {
+            m.status = status(state, "mike", AccessMode::Control);
+            assert_eq!(
+                m.password_to_read(),
+                None,
+                "no password may be shown in {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_shown_before_the_live_password_arrives() {
+        let mut m = model();
+        m.status = status(State::Connected, "mike", AccessMode::Control);
+        assert_eq!(m.password_to_read(), None);
+    }
+
+    #[test]
+    fn a_new_connection_refetches_the_password() {
+        // The one held is from the previous connection and is already spent,
+        // so arriving in this state has to ask the daemon again.
+        let mut m = model();
+        m.session = Some(session("mike"));
+        m.status = status(State::Listening, "mike", AccessMode::Control);
+
+        let effects = reduce(
+            &mut m,
+            Event::StatusPolled(status(State::Connected, "mike", AccessMode::Control)),
+        );
+        assert_eq!(effects, vec![Effect::FetchInvitation { copy: false }]);
+
+        // But not once per poll tick while they are still sitting there.
+        let again = reduce(
+            &mut m,
+            Event::StatusPolled(status(State::Connected, "mike", AccessMode::Control)),
+        );
+        assert_eq!(
+            again,
+            Vec::new(),
+            "one request per connection, not per poll"
+        );
+    }
+
+    #[test]
+    fn copying_the_password_puts_the_live_one_on_the_clipboard() {
+        let mut m = model();
+        m.session = Some(session("mike"));
+        m.status = status(State::Connected, "mike", AccessMode::Control);
+
+        let effects = reduce(&mut m, Event::CopyPasswordClicked);
+        assert_eq!(
+            effects,
+            vec![Effect::CopyToClipboard(session("mike").password)]
+        );
+        assert!(message(&m).contains("copied"), "{}", message(&m));
+    }
+
+    #[test]
+    fn a_spent_password_is_never_copied() {
+        // The session is still cached after they leave, but its password has
+        // been rotated; copying it would hand over something that cannot work.
+        let mut m = model();
+        m.session = Some(session("mike"));
+        m.status = status(State::Listening, "mike", AccessMode::Control);
+
+        let effects = reduce(&mut m, Event::CopyPasswordClicked);
+        assert_eq!(effects, Vec::new(), "nothing may reach the clipboard");
+        assert!(message(&m).contains("no live password"), "{}", message(&m));
     }
 
     #[test]

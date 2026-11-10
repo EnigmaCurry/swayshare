@@ -69,7 +69,10 @@ done
 [ -n "${WAYLAND_DISPLAY:-}" ] || { echo "sway never came up"; cat "$SB/sway.log"; exit 1; }
 export SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.* 2>/dev/null | head -1)
 
-"$BIN" add mike 10.0.0.3/32 >/dev/null
+# Loopback, so a test connection is actually admitted by the gate: the
+# window's connected-but-not-yet-authenticated state cannot be reached
+# otherwise, and that is where the one-time password is shown.
+"$BIN" add mike 127.0.0.1/32 >/dev/null
 python3 - "$XDG_CONFIG_HOME/swayshare/config.toml" "$PORT" <<'PY'
 import sys
 path, port = sys.argv[1], sys.argv[2]
@@ -150,6 +153,34 @@ RESULT=$(compare 01-off 02-sharing)
 case "$RESULT" in
   different*) pass "the window re-rendered when sharing began ($RESULT)" ;;
   *)          fail "the window did not react to the session starting" ;;
+esac
+
+echo "== the one-time password appears while someone waits to type it =="
+# On a machine with no notification daemon this is the only place the owner
+# can read it from, so the session cannot proceed without it. A bare TCP
+# connect is exactly what that state looks like: connected, not yet in.
+python3 - "$PORT" <<'PROBEPY' &
+import socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+s.recv(12)
+time.sleep(8)   # hold it open while the window is inspected
+s.close()
+PROBEPY
+PROBE=$!
+sleep 4
+shot 04-awaiting
+RESULT=$(compare 02-sharing 04-awaiting)
+case "$RESULT" in
+  different*) pass "the window re-rendered when they connected ($RESULT)" ;;
+  *)          fail "the window did not react to a waiting connection" ;;
+esac
+wait $PROBE 2>/dev/null
+sleep 3
+shot 05-left
+RESULT=$(compare 04-awaiting 05-left)
+case "$RESULT" in
+  different*) pass "the password row went away when they left ($RESULT)" ;;
+  *)          fail "the password row is still showing with nobody waiting" ;;
 esac
 
 echo "== and must drop the invitation when the session ends =="
