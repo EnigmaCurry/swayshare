@@ -179,6 +179,11 @@ time. Only connections from your own address are accepted
 Access expires automatically in 30m.
 ```
 
+The password also appears in the tray while someone is waiting to type it —
+in the tooltip and in the menu — so a machine with no notification daemon
+can still run a session. It is withdrawn the moment nobody is waiting,
+because it is rotated on disconnect and a spent secret is worse than none.
+
 **The password is a one-time secret, spoken not pasted.** There is no stored
 or static password. The moment someone connects, swayshare mints a short word
 passphrase (e.g. `flip mock army zero`) and pops it up on *your* screen

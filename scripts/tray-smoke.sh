@@ -175,7 +175,23 @@ PY
   echo "$(menu_layout)" | grep -q "is connecting" \
     && pass "menu says they are still connecting" \
     || fail "menu claimed control before authentication: $(menu_layout)"
+
+  # On a machine with no notification daemon the tray is the only place the
+  # one-time password appears, and without it the session cannot proceed at
+  # all - the owner has nothing to read aloud.
+  LIVE_PW=$("$BIN" invite --json \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
+  echo "$(menu_layout)" | grep -qF "$LIVE_PW" \
+    && pass "the menu offers the one-time password while they wait to type it" \
+    || fail "the menu did not carry the password: $(menu_layout)"
   wait $PROBE 2>/dev/null
+
+  # It is rotated the moment they disconnect, so holding it on screen would
+  # have the owner dictate a secret that no longer works.
+  sleep 3
+  echo "$(menu_layout)" | grep -q "Read aloud" \
+    && fail "the password is still offered with nobody waiting: $(menu_layout)" \
+    || pass "the password is withdrawn once nobody is waiting to type it"
 
   echo "== authenticate, and the item should demand attention =="
   python3 "$CLIENT" --port "$PORT" \

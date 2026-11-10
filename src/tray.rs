@@ -44,6 +44,9 @@ pub struct SwayshareTray {
     peers: Vec<Peer>,
     /// Set when the last action failed, so the menu can say so.
     last_error: Option<String>,
+    /// The live one-time password, held only while a connection is waiting
+    /// for it. See [`SwayshareTray::password_to_read`].
+    password: Option<String>,
     commands: mpsc::UnboundedSender<Command>,
 }
 
@@ -53,7 +56,21 @@ impl SwayshareTray {
             status: Status::off(),
             peers: Config::load().map(|c| c.peers).unwrap_or_default(),
             last_error: None,
+            password: None,
             commands,
+        }
+    }
+
+    /// The one-time password to read aloud, if there is one to read.
+    ///
+    /// Gated on the state rather than merely on having a password, so a value
+    /// left over from a previous connection can never be shown as if it were
+    /// current - it is rotated the moment the peer disconnects, and offering a
+    /// spent secret would have the owner dictate something that cannot work.
+    fn password_to_read(&self) -> Option<&str> {
+        match self.status.state {
+            State::Connected => self.password.as_deref(),
+            _ => None,
         }
     }
 
@@ -191,6 +208,11 @@ impl ksni::Tray for SwayshareTray {
 
     fn tool_tip(&self) -> ksni::ToolTip {
         let mut description = String::new();
+        // First: while someone is waiting to be let in, this is the only line
+        // the owner needs, and some hosts show only the first lines.
+        if let Some(password) = self.password_to_read() {
+            description.push_str(&format!("Read aloud to let them in: {password}\n"));
+        }
         if let Some(listen) = &self.status.listen {
             description.push_str(&format!("Listening on {listen}"));
         }
@@ -242,6 +264,19 @@ impl ksni::Tray for SwayshareTray {
             }
             .into(),
         );
+        // Also in the menu, not only the tooltip: whether a tooltip is shown
+        // at all, and how much of it, is up to the tray host, and this is the
+        // one piece of information the session cannot proceed without.
+        if let Some(password) = self.password_to_read() {
+            items.push(
+                StandardItem {
+                    label: format!("Read aloud to let them in: {password}"),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
         if let Some(secs) = self.status.expires_in_seconds {
             items.push(
                 StandardItem {
@@ -362,19 +397,9 @@ pub async fn run() -> Result<()> {
     let poll_handle = handle.clone();
     let poll_socket = socket.clone();
     let poller = tokio::spawn(async move {
-        loop {
-            let status = fetch_status(&poll_socket).await;
-            let changed = poll_handle
-                .update(move |tray: &mut SwayshareTray| {
-                    let changed = tray.status.state != status.state;
-                    tray.status = status;
-                    changed
-                })
-                .await;
-            // `None` means the tray is gone, so there is nothing left to poll.
-            if changed.is_none() {
-                break;
-            }
+        // Goes through `refresh` rather than fetching inline, so the poller
+        // and the post-command path cannot show different things.
+        while refresh(&poll_handle, &poll_socket).await.is_some() {
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     });
@@ -466,7 +491,7 @@ async fn serve_commands(
                 report(&handle, open_config_window()).await;
             }
         }
-        refresh(&handle, &socket).await;
+        let _ = refresh(&handle, &socket).await;
     }
     QuitReason::ChannelClosed
 }
@@ -501,11 +526,38 @@ async fn report(handle: &ksni::Handle<SwayshareTray>, result: Result<()>) {
         .await;
 }
 
-async fn refresh(handle: &ksni::Handle<SwayshareTray>, socket: &std::path::Path) {
+/// Bring the displayed state in line with the daemon.
+///
+/// `None` means the tray is gone, which is the poller's cue to stop.
+async fn refresh(handle: &ksni::Handle<SwayshareTray>, socket: &std::path::Path) -> Option<()> {
     let status = fetch_status(socket).await;
+    // Only asked for while someone is actually waiting to type it, so the
+    // tray is not sitting on a live secret for the whole session.
+    let password = match status.state {
+        State::Connected => fetch_password(socket).await,
+        _ => None,
+    };
     handle
-        .update(move |tray: &mut SwayshareTray| tray.status = status)
-        .await;
+        .update(move |tray: &mut SwayshareTray| {
+            tray.status = status;
+            tray.password = password;
+        })
+        .await
+}
+
+/// The live one-time password, or `None` if the daemon will not give one up.
+///
+/// Fetched separately rather than carried in `Status`: a status reply is the
+/// thing that gets piped into a script or pasted into a bug report, and the
+/// password is kept out of it deliberately.
+async fn fetch_password(socket: &std::path::Path) -> Option<String> {
+    match ipc::request(socket, &Request::Invite)
+        .await
+        .and_then(ipc::expect_ok)
+    {
+        Ok(Response::Session(session)) => Some(session.password),
+        _ => None,
+    }
 }
 
 /// Ask the daemon for its state, treating an unreachable daemon as "off".
@@ -571,6 +623,8 @@ fn open_config_window() -> Result<()> {
 mod tests {
     use super::*;
     use ipnet::IpNet;
+    // The rendering methods under test are the trait's, not inherent ones.
+    use ksni::Tray;
 
     fn tray_with(status: Status, peers: &[(&str, &str)]) -> SwayshareTray {
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -584,6 +638,88 @@ mod tests {
             })
             .collect();
         tray
+    }
+
+    fn tray_awaiting_password(state: State, password: &str) -> SwayshareTray {
+        let mut tray = tray_with(active_status(state, "mike"), &[]);
+        tray.password = Some(password.to_string());
+        tray
+    }
+
+    /// Every label the menu puts on screen, submenus included.
+    fn menu_labels(tray: &SwayshareTray) -> Vec<String> {
+        fn walk(items: &[MenuItem<SwayshareTray>], out: &mut Vec<String>) {
+            for item in items {
+                match item {
+                    MenuItem::Standard(i) => out.push(i.label.clone()),
+                    MenuItem::SubMenu(m) => {
+                        out.push(m.label.clone());
+                        walk(&m.submenu, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&tray.menu(), &mut out);
+        out
+    }
+
+    #[test]
+    fn the_password_is_offered_while_a_connection_waits_for_it() {
+        // The one path to this secret used to be a desktop notification, so on
+        // a machine with no notification daemon the session could not proceed
+        // at all. Both surfaces carry it: whether a tooltip is rendered, and
+        // how much of it, is up to the tray host.
+        let tray = tray_awaiting_password(State::Connected, "flip mock army zero");
+
+        assert!(
+            tray.tool_tip().description.contains("flip mock army zero"),
+            "the tooltip must carry the password: {:?}",
+            tray.tool_tip().description
+        );
+        assert!(
+            menu_labels(&tray)
+                .iter()
+                .any(|l| l.contains("flip mock army zero")),
+            "the menu must carry it too: {:?}",
+            menu_labels(&tray)
+        );
+    }
+
+    #[test]
+    fn a_spent_password_is_never_shown() {
+        // It is rotated the instant the peer disconnects, so showing one held
+        // over from a previous connection would have the owner read out
+        // something that cannot work. Gated on the state, not on merely
+        // having a value.
+        for state in [State::Off, State::Listening, State::Authenticated] {
+            let tray = tray_awaiting_password(state, "stale words here now");
+            assert_eq!(
+                tray.password_to_read(),
+                None,
+                "no password may be offered in {state:?}"
+            );
+            assert!(
+                !tray.tool_tip().description.contains("stale words here now"),
+                "the tooltip leaked a spent password in {state:?}"
+            );
+            assert!(
+                !menu_labels(&tray)
+                    .iter()
+                    .any(|l| l.contains("stale words here now")),
+                "the menu leaked a spent password in {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_claimed_when_there_is_no_password() {
+        // The daemon may refuse the invite request; the tray must then say
+        // nothing rather than show an empty prompt.
+        let tray = tray_with(active_status(State::Connected, "mike"), &[]);
+        assert_eq!(tray.password_to_read(), None);
+        assert!(!tray.tool_tip().description.contains("Read aloud"));
     }
 
     fn active_status(state: State, peer: &str) -> Status {
