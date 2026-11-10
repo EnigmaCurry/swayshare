@@ -297,12 +297,17 @@ pub fn reduce(model: &mut Model, event: Event) -> Vec<Effect> {
         Event::StatusPolled(status) => status_polled(model, status),
 
         Event::PeersLoaded(peers) => {
+            // Hold the selection on the same *peer*, not the same row.
+            // Peers are kept sorted by name and can be added or removed from
+            // the tray or the CLI while this window is open, so an index taken
+            // before the reload can silently come to mean somebody else - and
+            // the next click on "Enable access" would hand them the desktop.
+            let was = model
+                .selected
+                .and_then(|i| model.peers.get(i))
+                .map(|p| p.name.clone());
             model.peers = peers;
-            // A removed peer must not leave the selection pointing past the
-            // end, or at somebody else.
-            if model.selected.is_some_and(|i| i >= model.peers.len()) {
-                model.selected = None;
-            }
+            model.selected = was.and_then(|name| model.peers.iter().position(|p| p.name == name));
             Vec::new()
         }
 
@@ -534,6 +539,31 @@ mod tests {
         reduce(&mut m, Event::StatusPolled(Status::off()));
         assert!(!m.can_stop());
         assert!(!m.can_copy());
+    }
+
+    #[test]
+    fn a_selection_follows_its_peer_when_the_list_is_reordered() {
+        // Peers are stored sorted by name, so one added from the tray or the
+        // CLI shifts every index after it. Holding the index would quietly
+        // repoint the selection at a different person, and granting access is
+        // one click away.
+        let mut m = model();
+        reduce(&mut m, Event::SelectionChanged(Some(1)));
+        assert_eq!(m.selected_peer().unwrap().name, "jane");
+
+        reduce(
+            &mut m,
+            Event::PeersLoaded(vec![
+                peer("alice", "10.0.0.1/32"),
+                peer("jane", "10.0.0.4/32"),
+                peer("mike", "10.0.0.3/32"),
+            ]),
+        );
+        assert_eq!(
+            m.selected_peer().map(|p| p.name.as_str()),
+            Some("jane"),
+            "the selection must follow the peer, not the row"
+        );
     }
 
     #[test]
