@@ -196,6 +196,33 @@ else
   fail "the saved certificate stopped working: $(tail -2 "$SB/client-reuse.log")"
 fi
 
+echo "== status shows the password while someone waits to type it =="
+# The surface a terminal-only user has when there is no notification daemon
+# to show it. A bare TCP connect is exactly that state: connected, not in.
+python3 - "$PORT" <<'WAITPY' &
+import socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+s.recv(12)
+time.sleep(6)
+s.close()
+WAITPY
+WAITER=$!
+sleep 2
+LIVE_PW=$("$BIN" invite --json \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
+"$BIN" status | grep -qF "$LIVE_PW" \
+  && pass "status prints the one-time password while they wait" \
+  || fail "status did not print the password: $("$BIN" status)"
+# --json is the scripted surface and must stay free of the live secret.
+"$BIN" status --json | grep -qF "$LIVE_PW" \
+  && fail "--json leaked the live password" \
+  || pass "status --json stays free of the password"
+wait $WAITER 2>/dev/null
+sleep 2
+"$BIN" status | grep -q "Password:" \
+  && fail "status still offers a password with nobody waiting: $("$BIN" status)" \
+  || pass "status withdraws the password once nobody is waiting"
+
 echo "== the wrong password is refused =="
 if python3 "$CLIENT" --port "$PORT" --password WRONGWRONGWRONGWRONGWRONG0 --ca "$CA" \
      --expect-auth-failure > "$SB/badpw.log" 2>&1; then

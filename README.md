@@ -180,8 +180,11 @@ Access expires automatically in 30m.
 ```
 
 The password also appears while someone is waiting to type it — in the tray
-tooltip and menu, and in the configuration window with a **Copy password**
-button — so a machine with no notification daemon can still run a session. It is withdrawn the moment nobody is waiting,
+tooltip and menu, in the configuration window with a **Copy password**
+button, and in `swayshare status` — so a machine with no notification daemon
+can still run a session. `swayshare status --json` deliberately omits it:
+that is the form that gets piped into status bars and scripts. Use
+`swayshare invite --json` if a script needs the password itself. It is withdrawn the moment nobody is waiting,
 because it is rotated on disconnect and a spent secret is worse than none.
 
 **The password is a one-time secret, spoken not pasted.** There is no stored

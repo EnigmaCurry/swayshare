@@ -791,7 +791,12 @@ fn format_error(e: &anyhow::Error) -> String {
 }
 
 /// Print a status block for humans.
-pub fn render_status(status: &Status) -> String {
+/// `password` is the live one-time password, shown only while someone is
+/// waiting to type it. Gated on the state here as well as at the call site:
+/// it is rotated the instant a peer disconnects, and a spent secret printed
+/// as if it were current would have the owner dictate something that cannot
+/// work.
+pub fn render_status(status: &Status, password: Option<&str>) -> String {
     let mut out = String::new();
     match status.state {
         State::Off => out.push_str("Remote access is off\n"),
@@ -803,6 +808,11 @@ pub fn render_status(status: &Status) -> String {
             Some(AccessMode::ViewOnly) => out.push_str("Someone is watching your screen\n"),
             _ => out.push_str("Someone is controlling your desktop\n"),
         },
+    }
+    if let Some(password) = password.filter(|_| status.state == State::Connected) {
+        // Directly under the heading: while someone is waiting to be let in,
+        // this is the only line that needs acting on.
+        out.push_str(&format!("  Password:    {password}   <- read this aloud\n"));
     }
     if let (Some(peer), Some(cidr)) = (&status.peer, &status.cidr) {
         out.push_str(&format!("  Peer:        {peer} ({cidr})\n"));
@@ -823,4 +833,60 @@ pub fn render_status(status: &Status) -> String {
         out.push_str(&format!("  Expires in:  {}\n", invite::humanize(secs)));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connected_status() -> Status {
+        Status {
+            state: State::Connected,
+            peer: Some("mike".into()),
+            cidr: Some("10.0.0.3/32".into()),
+            listen: Some("10.0.0.10:5900".into()),
+            connections: 1,
+            authenticated: 0,
+            mode: Some(AccessMode::Control),
+            expires_in_seconds: Some(1800),
+        }
+    }
+
+    #[test]
+    fn status_shows_the_password_while_someone_waits_to_type_it() {
+        // The only surface a terminal-only user has when there is no
+        // notification daemon to show it.
+        let text = render_status(&connected_status(), Some("spew pager seven pluck"));
+        assert!(
+            text.contains("spew pager seven pluck"),
+            "the password must be printed: {text}"
+        );
+        assert!(
+            text.contains("read this aloud"),
+            "it must say what to do with it: {text}"
+        );
+    }
+
+    #[test]
+    fn status_never_prints_a_spent_password() {
+        // Rotated the moment they disconnect, so one held over from a previous
+        // connection must not be printed as though it were current.
+        for state in [State::Off, State::Listening, State::Authenticated] {
+            let mut status = connected_status();
+            status.state = state;
+            let text = render_status(&status, Some("stale words here now"));
+            assert!(
+                !text.contains("stale words here now"),
+                "a spent password leaked in {state:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_without_a_password_says_nothing_about_one() {
+        let text = render_status(&connected_status(), None);
+        assert!(!text.contains("Password:"), "{text}");
+        // The rest of the report is unaffected.
+        assert!(text.contains("mike (10.0.0.3/32)"), "{text}");
+    }
 }

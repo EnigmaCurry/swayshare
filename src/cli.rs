@@ -250,10 +250,18 @@ async fn status(json: bool) -> Result<()> {
         ipc::Status::off()
     };
 
+    // Only while a connection is actually waiting on it. Fetched separately
+    // rather than carried in `Status`, so `--json` - the form that gets piped
+    // into scripts and status bars - stays free of the live secret.
+    let password = match status.state {
+        ipc::State::Connected => fetch_password(&socket).await,
+        _ => None,
+    };
+
     if json {
         println!("{}", serde_json::to_string(&status)?);
     } else {
-        print!("{}", daemon::render_status(&status));
+        print!("{}", daemon::render_status(&status, password.as_deref()));
     }
     Ok(())
 }
@@ -311,6 +319,17 @@ async fn show_cert() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The live one-time password, or `None` if the daemon will not give one up.
+async fn fetch_password(socket: &std::path::Path) -> Option<String> {
+    match ipc::request(socket, &Request::Invite)
+        .await
+        .and_then(ipc::expect_ok)
+    {
+        Ok(Response::Session(session)) => Some(session.password),
+        _ => None,
+    }
 }
 
 async fn daemon_is_running(socket: &std::path::Path) -> bool {
