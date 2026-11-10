@@ -25,7 +25,7 @@ use crate::paths;
 use crate::window::{self, Effect, Event, Model};
 use anyhow::Result;
 use gtk::prelude::*;
-use gtk::{gdk, gio};
+use gtk::{gdk, gio, glib};
 use gtk4 as gtk;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -493,14 +493,25 @@ fn wire(ui: &Rc<Ui>) {
         );
         let for_errors = Rc::clone(ui);
         drag.connect_prepare(move |_, _, _| {
-            // A gdk::FileList and not hand-rolled text/uri-list: GTK's own
-            // serialisers for it include the document-portal path, which is
-            // what lets a sandboxed chat client read what it is handed.
+            // Offer text/uri-list and nothing else, deliberately.
+            //
+            // Handing over a gdk::FileList would be the idiomatic thing, and
+            // it also advertises application/vnd.portal.filetransfer, which
+            // is how a sandboxed receiver reaches a file outside its sandbox.
+            // But Flutter's desktop_drop - what LocalSend and other Flutter
+            // apps use - lists the portal target ahead of text/uri-list in
+            // its own drop targets, and GTK matches against the receiver's
+            // order, not ours. So it always picks the portal target, fails to
+            // resolve the token, and the drop silently does nothing. Source
+            // ordering cannot fix that. GTK3 sources like Thunar work there
+            // precisely because they never offer the portal target, so this
+            // offers what they offer.
+            //
+            // Nothing is lost for GTK receivers: GTK registers a
+            // text/uri-list -> GdkFileList deserialiser, so a drop target
+            // asking for files still gets them.
             match Identity::export_pem() {
-                Ok(path) => {
-                    let files = gdk::FileList::from_array(&[gio::File::for_path(path)]);
-                    Some(gdk::ContentProvider::for_value(&files.to_value()))
-                }
+                Ok(path) => Some(certificate_drag_content(path)),
                 Err(e) => {
                     // Returning None just means nothing is dragged, which on
                     // its own looks like the window ignoring the gesture.
@@ -614,6 +625,14 @@ fn layout(ui: &Rc<Ui>) -> gtk::Box {
     root
 }
 
+/// What the certificate drag hands over: one CRLF-terminated file URI, as
+/// text/uri-list specifies. Named so the test that asserts which MIME types
+/// this advertises cannot drift away from what the drag actually offers.
+fn certificate_drag_content(path: std::path::PathBuf) -> gdk::ContentProvider {
+    let uri = format!("{}\r\n", gio::File::for_path(path).uri());
+    gdk::ContentProvider::for_bytes("text/uri-list", &glib::Bytes::from(uri.as_bytes()))
+}
+
 fn padded_box(orientation: gtk::Orientation, spacing: i32) -> gtk::Box {
     gtk::Box::builder()
         .orientation(orientation)
@@ -641,4 +660,40 @@ fn present_fatal(app: &gtk::Application, message: &str) {
         .child(&label)
         .build()
         .present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_drag_offers_text_uri_list_and_nothing_else() {
+        // Guards the LocalSend fix. Offering a file-typed value instead would
+        // also advertise application/vnd.portal.filetransfer, which Flutter's
+        // desktop_drop prefers and then fails to resolve, silently dropping
+        // nothing. See certificate_drag_content.
+        if gtk::init().is_err() {
+            // No display: nothing to assert against. Runs on a developer's
+            // machine and in the GUI smoke suite, skips in a bare CI shell.
+            return;
+        }
+        let provider = certificate_drag_content(std::path::PathBuf::from("/tmp/x.pem"));
+        let offered = provider.formats().union_serialize_mime_types();
+        assert_eq!(
+            offered.to_str(),
+            "text/uri-list",
+            "exactly one MIME type must be offered"
+        );
+    }
+
+    #[test]
+    fn the_drag_payload_is_a_crlf_terminated_file_uri() {
+        if gtk::init().is_err() {
+            return;
+        }
+        // Not read back off the provider - GDK has no synchronous accessor -
+        // so assert the same string the provider is built from.
+        let uri = format!("{}\r\n", gio::File::for_path("/tmp/x.pem").uri());
+        assert_eq!(uri, "file:///tmp/x.pem\r\n");
+    }
 }
