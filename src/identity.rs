@@ -50,7 +50,7 @@ impl Identity {
     /// see it. `None` keeps whatever the stored certificate covers, for the
     /// eager generation at daemon start where no session has been bound yet.
     pub fn ensure(listen_ip: Option<IpAddr>) -> Result<Self> {
-        let dir = paths::data_dir()?.join("tls");
+        let dir = tls_dir()?;
         paths::ensure_private_dir(&dir)?;
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
@@ -88,6 +88,25 @@ impl Identity {
             fingerprint,
         })
     }
+
+    /// The stored certificate in PEM form, or `None` if there is not one yet.
+    ///
+    /// Deliberately never generates one, unlike [`Identity::ensure`]: a
+    /// certificate handed to a helper before any session exists would be
+    /// reissued the moment access is granted and an address has to be
+    /// covered, leaving them holding a file that no longer verifies.
+    pub fn stored_pem() -> Result<Option<String>> {
+        let path = tls_dir()?.join("cert.pem");
+        match std::fs::read_to_string(&path) {
+            Ok(pem) => Ok(Some(pem)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+}
+
+fn tls_dir() -> Result<PathBuf> {
+    Ok(paths::data_dir()?.join("tls"))
 }
 
 /// The SANs the certificate should carry, most recently used address first.
@@ -164,7 +183,7 @@ fn generate(cert_path: &Path, key_path: &Path, names: &[String]) -> Result<()> {
 }
 
 /// Compute the DER fingerprint of the first certificate in a PEM bundle.
-fn fingerprint_from_pem(pem: &str) -> Result<String> {
+pub fn fingerprint_from_pem(pem: &str) -> Result<String> {
     let body: String = pem
         .lines()
         .skip_while(|l| !l.starts_with("-----BEGIN CERTIFICATE-----"))

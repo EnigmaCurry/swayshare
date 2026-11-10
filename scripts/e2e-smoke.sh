@@ -147,7 +147,14 @@ PY
 [ $? -eq 0 ] || FAILURES=$((FAILURES + 1))
 
 echo "== a real client authenticates and its input reaches the desktop =="
-CA="$XDG_DATA_HOME/swayshare/tls/cert.pem"
+# Fetch the certificate the way a user does rather than reaching into the data
+# directory, so `swayshare cert` is covered and the PEM a helper is actually
+# handed is the one that gets verified. Note what is *not* passed: no client
+# certificate and no CRL. That is exactly the shape of credentials Remmina
+# sends when only its "CA certificate" field is filled in.
+CA="$SB/swayshare.pem"
+"$BIN" cert > "$CA" 2>/dev/null
+[ -s "$CA" ] || fail "swayshare cert produced no certificate"
 PASSWORD=$("$BIN" invite --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
 CLIENT="$(dirname "$0")/vnc_client.py"
 rm -f "$SB/KEY_ARRIVED"

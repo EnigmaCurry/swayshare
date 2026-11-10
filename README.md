@@ -157,17 +157,26 @@ swayshare stop
 ```
 Remote support invitation
 -------------------------
-Client:   TigerVNC (or any VeNCrypt-capable client)
+Client:   TigerVNC, Remmina, or any VeNCrypt-capable client
 Address:  10.0.0.10:5900
 Username: support
 TLS cert: SHA256:5C:A1:F9:4B:...
 Password: I will read it to you when you connect
 
 You will have full control of the screen, keyboard and pointer,
-at the same time as me. Connect through the VPN tunnel. When you
-connect I will read you a one-time password to type in - it is
-different every time. Only connections from your own address are
-accepted (10.0.0.3/32). Access expires automatically in 30m.
+at the same time as me.
+
+I will also send you swayshare.pem - the certificate your client
+checks this machine against. Compare its fingerprint with the one
+above. Only one field wants it: in Remmina that is "CA certificate",
+and the CRL, client certificate and client key fields must be left
+empty.
+
+Connect through the VPN tunnel. When you connect I will read
+you a one-time password to type in - it is different every
+time. Only connections from your own address are accepted
+(10.0.0.3/32).
+Access expires automatically in 30m.
 ```
 
 **The password is a one-time secret, spoken not pasted.** There is no stored
@@ -178,11 +187,42 @@ they type it in. It is rotated the instant they disconnect, so a secret said
 once can never be reused for a later connection. The word count is
 configurable with `security.password_words` (default 4).
 
-**Client choice matters.** wayvnc wraps the session in VeNCrypt x509 TLS plus
-a password. [TigerVNC](https://tigervnc.org) (`vncviewer`) is the tested,
-recommended client. Remmina's VNC plugin is unreliable with this auth scheme
-— it tends to get stuck prompting for CA/client certificates. With TigerVNC
-you only need the server's self-signed cert; no client certificate is used.
+**The helper needs your certificate.** wayvnc wraps the session in VeNCrypt
+x509 TLS plus a password, so the client has to verify this machine against
+something. Send them the certificate — it is public, and
+`swayshare cert` prints it:
+
+```sh
+swayshare cert > swayshare.pem    # send this file to your helper
+```
+
+The fingerprint in the invitation is what makes that safe to send over any
+channel: they compare it against the file before trusting it.
+
+**Only the CA field takes it.** This is the one step that trips people up.
+Clients ask for up to four certificate files — CA certificate, CA CRL, client
+certificate, client key — but a swayshare session uses exactly one. Fill in
+the **CA certificate** and leave the other three **empty**. wayvnc never asks
+for a client certificate, so filling those fields buys nothing and costs you
+a failed handshake if the pair does not load — libvncclient aborts rather
+than carrying on without them. Given no CA at all it cannot verify us and
+refuses to authenticate, which is what dismissing that dialog empty looks
+like from the other side.
+
+[TigerVNC](https://tigervnc.org) (`vncviewer`) is the tested, recommended
+client:
+
+```sh
+vncviewer -SecurityTypes=X509Plain -X509CA=swayshare.pem HOST:5900
+```
+
+[Remmina](https://remmina.org) works too. Set **Username** to the one in the
+invitation, connect, and when the certificate dialog appears pick
+`swayshare.pem` as the CA certificate, leaving CRL, client certificate and
+client key blank. Remmina remembers the CA path, so later connections only
+need the dialog confirmed. The dialog cannot be skipped entirely: Remmina
+only bypasses it when all four fields are set, and setting the client
+certificate fields breaks the handshake.
 
 ### The tray applet
 

@@ -5,6 +5,7 @@
 
 use crate::config::{self, Config};
 use crate::daemon::{self, Daemon};
+use crate::identity::{self, Identity};
 use crate::invite;
 use crate::ipc::{self, AccessMode, Request, Response};
 use crate::paths;
@@ -89,6 +90,14 @@ enum Command {
     Gui,
     /// Revoke access and exit the running daemon
     Quit,
+    /// Print the TLS certificate the remote viewer needs
+    ///
+    /// The certificate is public; send it to the person you are inviting.
+    /// Their client verifies this machine against it, and strict clients
+    /// refuse to connect without it. In Remmina it goes in the "CA
+    /// certificate" field - the CRL, client certificate and client key
+    /// fields are unused and must be left empty.
+    Cert,
     /// Print the config file path
     #[command(name = "config-path")]
     ConfigPath,
@@ -128,6 +137,7 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Stop => simple(Request::Stop, "Access revoked.").await,
         Command::Status { json } => status(json).await,
         Command::Invite { json } => show_invite(json).await,
+        Command::Cert => show_cert().await,
         Command::Daemon => Daemon::run().await,
         Command::Tray => crate::tray::run().await,
         Command::Gui => run_gui(),
@@ -263,6 +273,41 @@ async fn show_invite(json: bool) -> Result<()> {
         }
         other => bail!("unexpected reply from the daemon: {other:?}"),
     }
+}
+
+/// Print the stored certificate, for the owner to pass on to their helper.
+///
+/// The PEM goes to stdout alone, so `swayshare cert > swayshare.pem` produces
+/// a file a client can use directly; the fingerprint and any warning are
+/// commentary and go to stderr.
+async fn show_cert() -> Result<()> {
+    let Some(pem) = Identity::stored_pem()? else {
+        bail!(
+            "no certificate yet - one is generated when the daemon first runs \
+             (try: swayshare start <peer>)"
+        );
+    };
+    print!("{pem}");
+    eprintln!(
+        "swayshare: SHA256:{}",
+        identity::fingerprint_from_pem(&pem)?
+    );
+
+    // A certificate sent before access is granted may not name the address
+    // that gets shared, in which case granting access reissues it and the
+    // copy the helper is holding stops verifying. Better to say so than to
+    // let them discover it as a handshake failure.
+    let socket = paths::control_socket()?;
+    if daemon_is_running(&socket).await
+        && let Ok(Response::Status(status)) = ipc::request(&socket, &Request::Status).await
+        && status.state == ipc::State::Off
+    {
+        eprintln!(
+            "swayshare: nothing is shared right now, so this certificate may still be \
+             reissued to cover the address you share from. Send it after 'swayshare start'."
+        );
+    }
+    Ok(())
 }
 
 async fn daemon_is_running(socket: &std::path::Path) -> bool {

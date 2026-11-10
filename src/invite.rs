@@ -10,7 +10,7 @@ pub fn render(session: &Session) -> String {
     let mut out = String::new();
     out.push_str("Remote support invitation\n");
     out.push_str("-------------------------\n");
-    out.push_str("Client:   TigerVNC (or any VeNCrypt-capable client)\n");
+    out.push_str("Client:   TigerVNC, Remmina, or any VeNCrypt-capable client\n");
     out.push_str(&format!("Address:  {}:{}\n", session.address, session.port));
     out.push_str(&format!("Username: {}\n", session.username));
     out.push_str(&format!("TLS cert: SHA256:{}\n", session.fingerprint));
@@ -30,6 +30,15 @@ pub fn render(session: &Session) -> String {
             out.push_str("your keyboard and mouse will not reach it.\n");
         }
     }
+    out.push('\n');
+    // Without the certificate a strict client cannot verify us and simply
+    // refuses; and the one real trap is that clients ask for up to four
+    // certificate files when only this one is used, so say so outright.
+    out.push_str("I will also send you swayshare.pem - the certificate your client\n");
+    out.push_str("checks this machine against. Compare its fingerprint with the one\n");
+    out.push_str("above. Only one field wants it: in Remmina that is \"CA certificate\",\n");
+    out.push_str("and the CRL, client certificate and client key fields must be left\n");
+    out.push_str("empty.\n");
     out.push('\n');
     out.push_str("Connect through the VPN tunnel. When you connect I will read\n");
     out.push_str("you a one-time password to type in - it is different every\n");
@@ -86,6 +95,25 @@ mod tests {
         assert!(text.contains("SHA256:AA:BB:CC"));
         assert!(text.contains("10.0.0.3/32"));
         assert!(text.contains("expires automatically in 1h"));
+    }
+
+    #[test]
+    fn the_invitation_explains_the_certificate_and_which_field_takes_it() {
+        // A helper cannot guess either of these, and getting the second one
+        // wrong is what makes a working setup look like a broken client.
+        let text = render(&session());
+        assert!(
+            text.contains("swayshare.pem"),
+            "the invitation must say a certificate is coming: {text}"
+        );
+        assert!(
+            text.contains("CA certificate"),
+            "it must name the field the certificate goes in: {text}"
+        );
+        assert!(
+            text.contains("must be left\nempty"),
+            "it must say the other certificate fields stay empty: {text}"
+        );
     }
 
     #[test]
